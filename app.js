@@ -789,6 +789,24 @@ function restartFresh() {
 }
 
 // -------------------------------------------------------------------- init
+// "Report a problem": a GitHub issue pre-filled with non-personal diagnostics (no measurement data, no paths).
+function reportUrl() {
+  const l = S.last;
+  const lines = [
+    '**What happened / 發生了什麼：**', '', '',
+    '**Which step / 卡在哪一步：**', '', '',
+    '---',
+    'Browser: ' + navigator.userAgent,
+    'Language: ' + (S.lang || '') + ' / ' + (navigator.language || ''),
+    'Raw pointer data (unadjustedMovement): ' + (S.unadjusted === null ? 'not measured yet' : S.unadjusted),
+    'Last result: ' + (l ? (l.theta.toFixed(1) + ' deg, n=' + l.n) : 'none'),
+    'Path: ' + (S.path || 'none') + ', pending apply: ' + S.pendingApply,
+    'Page: ' + location.origin + location.pathname
+  ];
+  return 'https://github.com/Hydr0neFN/mousecal/issues/new?title=' + encodeURIComponent('[problem] ') +
+    '&body=' + encodeURIComponent(lines.join('\n'));
+}
+
 function init() {
   load();
   // a returning visitor goes straight to re-measuring, compared with the last result
@@ -863,6 +881,7 @@ function init() {
   // uninstall lives in the footer and never depends on a measurement
   $('unRestoreEpp').addEventListener('change', () => { refreshUninstall(); renderSteps(); });
   refreshUninstall();
+  $('reportLink').addEventListener('click', () => { $('reportLink').href = reportUrl(); });
   renderAll();
 }
 

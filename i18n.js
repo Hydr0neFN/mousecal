@@ -162,6 +162,7 @@ export const STRINGS = {
     btnDownloadCsv: '下載這次的原始資料（CSV）',
     csvInfo: '瀏覽器回報 {n} 筆移動，錄了 {s} 秒。',
     csvNone: '還沒有可以下載的資料。',
+    reportLink: '遇到問題？到 GitHub 回報（會自動帶入你的瀏覽器和系統資訊）',
     footPrivacy: '所有計算都在你的瀏覽器裡完成，量測資料不會上傳。',
     footCredit: '作者 <a href="https://github.com/Hydr0neFN">Hydr0neFN</a> · MIT 授權 · 修正由 <a href="https://github.com/RawAccelOfficial/rawaccel">Raw Accel</a> 完成',
     degUnit: '°'
@@ -324,6 +325,7 @@ export const STRINGS = {
     btnDownloadCsv: 'Download the raw data from this run (CSV)',
     csvInfo: 'The browser reported {n} movements over {s} seconds.',
     csvNone: 'No data to download yet.',
+    reportLink: 'Something went wrong? Report it on GitHub (browser and system info are filled in for you)',
     footPrivacy: 'Everything is computed in your browser; measurement data is never uploaded.',
     footCredit: 'By <a href="https://github.com/Hydr0neFN">Hydr0neFN</a> · MIT license · the fix itself is done by <a href="https://github.com/RawAccelOfficial/rawaccel">Raw Accel</a>',
     degUnit: ' deg'
