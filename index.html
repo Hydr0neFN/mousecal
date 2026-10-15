@@ -79,6 +79,8 @@
         <svg id="dial" viewBox="0 0 330 300" role="img" aria-label="Angle dial"></svg>
       </figure>
       <div class="result-copy">
+        <p id="rdSaved" class="saved-tag" hidden></p>
+        <p id="savedCaution" class="small-note" hidden data-i18n="savedCaution"></p>
         <p class="readout"><span id="rdTheta" class="rd-theta">--</span><span id="rdSe" class="rd-se"></span></p>
         <p id="rdSentence" class="sentence"></p>
         <p id="rdConf" class="conf"></p>
@@ -101,7 +103,7 @@
           <pre class="cmd small-cmd" id="drvCmd">Get-CimInstance Win32_SystemDriver -Filter "Name='rawaccel'" | Select-Object Name, State</pre>
         </div>
 
-        <details class="stats">
+        <details class="stats" id="statsBox">
           <summary data-i18n="statsTitle"></summary>
           <dl id="statsList" class="stat-list"></dl>
           <div class="hist-wrap">
@@ -144,7 +146,7 @@
         </div>
 
         <div id="manualSteps" class="manual" hidden>
-          <h3 data-i18n="manualTitle"></h3>
+          <h3 data-i18n="manualTitle" data-i18n-ok="manualTitle" data-i18n-fail="manualTitleNoCopy"></h3>
           <ol class="big-steps">
             <li>
               <div class="step-body">
@@ -173,6 +175,7 @@
             </li>
           </ol>
           <p id="cmdNote" class="small-note"></p>
+          <p class="small-note copy-hint" hidden data-i18n="copyHint"></p>
           <pre id="cmdInstall" class="cmd" tabindex="0"></pre>
         </div>
 
@@ -183,6 +186,7 @@
             <li data-i18n="disc2"></li>
             <li data-i18n="disc3"></li>
             <li data-i18n="disc4"></li>
+            <li data-i18n="disc9"></li>
             <li data-i18n="disc5"></li>
             <li data-i18n="disc6"></li>
             <li data-i18n="disc7"></li>
@@ -267,12 +271,14 @@
 <footer class="foot">
   <section class="uninstall" aria-labelledby="h-un">
     <h3 id="h-un" data-i18n="unTitle"></h3>
+    <label class="check"><input type="checkbox" id="unRestoreEpp" checked> <span data-i18n="unRestoreEpp"></span></label>
     <button id="btnOneClickUn" class="btn small ghost" type="button" data-i18n="btnOneClickUn"></button>
     <span id="oneClickUnMsg" class="copy-msg inline" role="status" aria-live="polite"></span>
     <p class="small-note" data-i18n="unOneNote"></p>
     <p class="small-note" hidden><code id="unUrl"></code></p>
     <div id="unManual" hidden>
-      <p class="small-note" data-i18n="unHow"></p>
+      <p class="small-note" data-i18n="unHow" data-i18n-ok="unHow" data-i18n-fail="unHowNoCopy"></p>
+      <p class="small-note copy-hint" hidden data-i18n="copyHint"></p>
       <pre id="cmdUninstall" class="cmd small-cmd" tabindex="0"></pre>
     </div>
   </section>

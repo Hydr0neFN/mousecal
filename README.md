@@ -89,7 +89,8 @@ The `try/catch` keeps the Win+R window open with the error visible if the downlo
 reports its own errors and waits for Enter by itself. The command stays under the 259 character Run-dialog limit.
 
 Parameters: `-Measured <deg>` (the angle the page measured), `-Rotation <deg>` (absolute value, manual use;
-exactly one of the two is required), `-Uninstall`, `-DryRun`, `-NoPause` (also `MOUSECAL_NO_PAUSE=1`).
+exactly one of the two is required), `-Uninstall`, `-RestorePointerPrecision` (only with `-Uninstall`), `-DryRun`,
+`-NoPause` (also `MOUSECAL_NO_PAUSE=1`).
 Numbers are parsed with the invariant culture; a comma is rejected. It works in Windows PowerShell 5.1 and
 PowerShell 7, needs an administrator terminal, uses TLS 1.2 and has no telemetry.
 
@@ -129,6 +130,22 @@ Install, in this order:
    the active rotation back before saying "active now, no reboot". Otherwise it asks for a reboot; the task
    applies the settings by itself afterwards. Exit code is 0 either way. Any failure after step 5 rolls back.
 
+**Pointer precision ("measure first").** Windows' "Enhance pointer precision" is mouse acceleration, and games
+that read the cursor instead of raw input would still get it, which spoils the measurement. So a real install
+turns it off: it reads `HKCU\Control Panel\Mouse` `MouseSpeed` / `MouseThreshold1` / `MouseThreshold2`; if
+`MouseSpeed` is not `0` it saves the three original values in the marker
+(`"pointerPrecision":{"MouseSpeed":"1","MouseThreshold1":"6","MouseThreshold2":"10"}`), sets all three to `"0"`
+and applies that at once with `SystemParametersInfo(SPI_SETMOUSE, 0, int[3]{0,0,0}, SPIF_UPDATEINIFILE |
+SPIF_SENDCHANGE)` (an in-memory P/Invoke, nothing compiled into `%TEMP%`). It is part of the transaction: a later
+failure puts the values this run found back. On a re-run an already saved original is kept, never replaced by the
+`0`s the tool wrote. It only happens when the elevated user is the signed-in desktop user (the token's user SID
+must equal the owner of `explorer.exe` in this session, via `Win32_Process` / `GetOwnerSid`); a standard user who
+typed an administrator's password into UAC gets a warning to turn it off themselves in Mouse settings > Pointer
+Options. `-DryRun` only prints it. `-Uninstall -RestorePointerPrecision` writes the saved values back (and applies
+them with `SPI_SETMOUSE`) when the marker has them and the same-user check passes; without the switch, or without
+saved values, "Enhance pointer precision" is left as it is and the output says so. Functions:
+`Get-PointerPrecision`, `Set-PointerPrecisionOff`, `Restore-PointerPrecision`, `Test-SameInteractiveUser`.
+
 Re-running keeps ownership: an existing valid marker is carried forward (its flags are never downgraded) and a
 rollback puts the original marker back byte for byte. Existing files that differ from the official ones are
 copied to the admin-only staging folder before being replaced and restored if the run fails; if a rollback step
@@ -156,11 +173,13 @@ back) so that later "re-measure, apply" and "uninstall" are one click on the pag
 | Link | Does |
 | --- | --- |
 | `mousecal://apply?m=<deg>` | adds the measured `<deg>` to the active rotation (new = active + m) and applies it |
-| `mousecal://uninstall` | runs the normal uninstall |
+| `mousecal://uninstall` (or `?epp=0`) | runs the normal uninstall; "Enhance pointer precision" is left as it is |
+| `mousecal://uninstall?epp=1` | uninstall with `-RestorePointerPrecision`: also puts "Enhance pointer precision" back to the saved original |
 
 `mousecal://apply/?m=8.2` and `mousecal:apply?m=8.2` are accepted too (browsers differ). The page's "One-click
-apply" button builds the link with `applyUrl(theta)` and the uninstall button with `uninstallUrl()` (both in
-`commands.js`). If the page keeps focus for about 1.5 s after the click, it says the tool does not look
+apply" button builds the link with `applyUrl(theta)` and the uninstall button with `uninstallUrl(restore)` (both in
+`commands.js`; `uninstallCommand(restore)` adds ` -RestorePointerPrecision`). The footer checkbox "also put
+'Enhance pointer precision' back to its original setting" (checked by default) is that `restore` flag. If the page keeps focus for about 1.5 s after the click, it says the tool does not look
 installed and points at "First install".
 
 What is installed (all by the elevated install, in an administrators-only place):
@@ -184,7 +203,7 @@ What is installed (all by the elevated install, in an administrators-only place)
 Security limits of the protocol:
 
 - Every action asks for confirmation each time (dialog, default No) and then UAC; nothing happens on a click alone.
-- Only two actions exist (apply a measured angle, uninstall). Any other text, extra parameter, other number
+- Only two actions exist (apply a measured angle, uninstall; the uninstall link takes nothing or exactly `?epp=0` / `?epp=1`). Any other text, extra parameter, other number
   shape (`^-?\d{1,2}(\.\d{1,2})?$`, invariant culture), or `|m| > 20` is rejected; so is any link longer than 64
   characters or with a character outside the set above. The new absolute rotation is limited to +-45.
 - The elevated step runs only the copy of `setup.ps1` in the administrators-only folder (the handler refuses
@@ -251,7 +270,8 @@ service key, and also waits for a key. That is why completion is detected by obs
 - Uninstall touches only what the ownership marker says this tool installed. The marker is
   `<ProgramFilesDir>\RawAccel\RawAccel\.mousecal-installed`, JSON
   `{"tool":"mousecal","installedDriver":true,"createdAppDir":true,"version":"1"}` (the plain text `mousecal` is
-  accepted as a legacy marker meaning both flags true).
+  accepted as a legacy marker meaning both flags true); when the install turned off "Enhance pointer precision" it
+  also holds `"pointerPrecision":{"MouseSpeed":"1","MouseThreshold1":"6","MouseThreshold2":"10"}` (the originals).
 - The `mousecal://` URL protocol (see "One-click link") always confirms, supports only apply (|m| <= 20,
   result within +-45) and uninstall, validates the link before building any command line, and its files and
   registry key can only be written by administrators.
@@ -308,6 +328,13 @@ MIT licensed, see `LICENSE`. By [Hydr0neFN](https://github.com/Hydr0neFN).
 安裝到 `C:\Program Files\RawAccel\` 並安裝它的驅動程式、寫入只含旋轉角度的 `settings.json`（既有檔案會先備份）、
 新增登入工作排程 `RawAccel Apply Settings`。有遊戲或反作弊程式在執行時會拒絕執行。不蒐集任何資料。
 解除安裝用同樣方式執行帶 `-Uninstall` 的指令。
+
+**先量再修（關掉「增強指標的精確度」）：** 安裝時會把 Windows 的「增強指標的精確度」（滑鼠加速）關掉，這樣不讀原始輸入、
+只看游標的遊戲也不會有加速。原本的三個值（`HKCU\Control Panel\Mouse` 的 `MouseSpeed`、`MouseThreshold1`、
+`MouseThreshold2`）會記在標記檔裡，安裝失敗會還原。重複執行安裝時，已經記下的原始值不會被覆蓋。只有在執行腳本的使用者
+就是目前登入桌面的使用者時才會動（否則顯示警告，請自己到「滑鼠設定 → 指標選項」關掉）。解除安裝加上
+`-RestorePointerPrecision`（網頁頁尾的勾選框，預設勾選；一鍵連結是 `mousecal://uninstall?epp=1`）會把原本的設定改回去；
+沒有勾選或沒有記錄到原始值，就維持現狀並在畫面上說明。
 
 **一鍵連結（`mousecal://`）：** 第一次安裝之後，安裝程式還會註冊 `mousecal://` 網址通訊協定（登錄在
 `HKLM\SOFTWARE\Classes\mousecal`，檔案 `handler.vbs`、`handler.ps1` 和一份 `setup.ps1` 副本放在

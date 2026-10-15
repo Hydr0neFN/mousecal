@@ -25,13 +25,14 @@ export function installCommand(measured, base = SITE_BASE) {
   return runCommand('-Measured ' + formatRotation(measured), base);
 }
 
-export function uninstallCommand(base = SITE_BASE) {
-  return runCommand('-Uninstall', base);
+// `restore` (true) also puts Windows "Enhance pointer precision" back to the value saved at install time.
+export function uninstallCommand(restore = false, base = SITE_BASE) {
+  return runCommand('-Uninstall' + (restore === true ? ' -RestorePointerPrecision' : ''), base);
 }
 
 // One-click links for people who already ran the install command once: the installer registers the
 // mousecal:// URL protocol, and its handler (setup.ps1 -> <ProgramFiles>\RawAccel\mousecal\) accepts exactly
-// these two shapes. It asks for confirmation every time. The handler refuses |m| > 20, so we do too.
+// these shapes (apply?m=<deg>, uninstall, uninstall?epp=1). It asks for confirmation every time. The handler refuses |m| > 20, so we do too.
 export const ONE_CLICK_MAX = 20;
 
 export function applyUrl(theta) {
@@ -41,6 +42,7 @@ export function applyUrl(theta) {
   return 'mousecal://apply?m=' + s;
 }
 
-export function uninstallUrl() {
-  return 'mousecal://uninstall';
+// `restore` (true) -> ?epp=1: the handler passes -RestorePointerPrecision. Without it nothing is restored.
+export function uninstallUrl(restore = false) {
+  return restore === true ? 'mousecal://uninstall?epp=1' : 'mousecal://uninstall';
 }

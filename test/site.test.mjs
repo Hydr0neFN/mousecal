@@ -104,7 +104,7 @@ test('setup.ps1 is ASCII only and pins every file', () => {
 // run exactly as the Win+R dialog would hand it to CreateProcess (verbatim command line), but
 // pointed at a host that cannot exist - never at the real site.
 test('copied command on a dead host shows the error and waits for Enter (Windows PowerShell 5.1)', { skip: process.platform !== 'win32' }, async () => {
-  for (const cmd of [installCommand(-12.3, 'https://mousecal.invalid'), uninstallCommand('https://mousecal.invalid')]) {
+  for (const cmd of [installCommand(-12.3, 'https://mousecal.invalid'), uninstallCommand(false, 'https://mousecal.invalid'), uninstallCommand(true, 'https://mousecal.invalid')]) {
     assert.ok(cmd.length < 259);
     const rest = cmd.slice('powershell '.length);
     const child = spawn('powershell.exe', [rest], { windowsVerbatimArguments: true, stdio: ['pipe', 'pipe', 'pipe'] });
@@ -272,4 +272,80 @@ test('raw-data CSV download: collapsed developer details, memory only, Blob + do
   assert.ok(!/capture/.test(store) && !/serializeStore\([^)]*capture/.test(app), 'raw samples are not persisted');
   const save = /function save\(\)[\s\S]*?\n\}/.exec(app)[0];
   assert.ok(!/capture|samples/.test(save));
+});
+
+test('uninstall command / link carry the pointer-precision restore option only when asked', () => {
+  const plain = uninstallCommand(), restore = uninstallCommand(true);
+  assert.equal(uninstallCommand(false), plain);
+  assert.ok(plain.includes(' -Uninstall}catch{') && !plain.includes('RestorePointerPrecision'));
+  assert.ok(restore.includes(' -Uninstall -RestorePointerPrecision}catch{'), restore);
+  assert.ok(plain.length < 259 && restore.length < 259, `${plain.length} / ${restore.length} chars`);
+  assert.equal(uninstallCommand('https://x.invalid'), plain, 'only a real true restores');
+  assert.equal(uninstallUrl(), 'mousecal://uninstall');
+  assert.equal(uninstallUrl(false), 'mousecal://uninstall');
+  assert.equal(uninstallUrl(true), 'mousecal://uninstall?epp=1');
+  const vbsCharset = /^[A-Za-z0-9:/?=.&-]+$/;
+  assert.ok(vbsCharset.test(uninstallUrl(true)) && uninstallUrl(true).length <= 64);
+});
+
+test('footer checkbox (checked by default) feeds the uninstall button and the copied command; disclosure line added', () => {
+  const html = read('index.html'), app = read('app.js');
+  assert.ok(/<input type="checkbox" id="unRestoreEpp" checked>/.test(html));
+  assert.ok(html.indexOf('id="unRestoreEpp"') > html.indexOf('<footer') && html.indexOf('id="unRestoreEpp"') < html.indexOf('id="btnOneClickUn"'), 'in the footer uninstall area, above the button');
+  assert.equal(STRINGS.zh.unRestoreEpp, '同時把『增強指標的精確度』改回原本的設定');
+  assert.ok(/Enhance pointer precision/.test(STRINGS.en.unRestoreEpp));
+  assert.equal(STRINGS.zh.disc9, '關掉 Windows 的『增強指標的精確度』（滑鼠加速），讓不讀原始輸入的遊戲也沒有加速；原本的設定會記下來，解除安裝時可以改回。');
+  assert.ok(/Enhance pointer precision/.test(STRINGS.en.disc9));
+  assert.ok(html.includes('data-i18n="disc9"'));
+  assert.ok(/uninstallUrl\(restoreEpp\(\)\)/.test(app) && /uninstallCommand\(restoreEpp\(\)\)/.test(app), 'the one-click button and the copied command both follow the checkbox');
+  assert.ok(/'change', refreshUninstall/.test(app));
+});
+
+test('copy that fails or is blocked is never reported as copied; the command is shown pre-selected with a Ctrl+C hint', async () => {
+  const app = read('app.js');
+  // run the real selectNode + copyQuiet against stubs
+  const src = /function selectNode[\s\S]*?\n\}\n/.exec(app)[0] + /const CLIPBOARD_TIMEOUT_MS[\s\S]*?\n\}\n/.exec(app)[0];
+  const make = ({ write, secure = true, exec = () => false, visible = true }) => {
+    const node = { select() {}, focus() {}, offsetParent: visible ? {} : null };
+    const nav = write ? { clipboard: { writeText: write } } : {};
+    const f = new Function('navigator', 'window', 'document', src + '; return copyQuiet;')(nav, { isSecureContext: secure }, { execCommand: exec });
+    return () => f('some command', node);
+  };
+  assert.equal(await make({ write: async () => {} })(), true, 'resolved write');
+  assert.equal(await make({ write: async () => { throw new Error('NotAllowedError'); } })(), false, 'rejected write');
+  assert.equal(await make({ write: () => { throw new Error('blocked'); } })(), false, 'synchronous exception');
+  assert.equal(await make({ write: () => Promise.reject(new Error('blocked')) })(), false, 'rejected promise');
+  assert.equal(await make({ write: () => new Promise(() => {}) })(), false, 'a write that never answers');
+  assert.equal(await make({ write: null, exec: () => true, visible: false })(), false, 'execCommand on a hidden node proves nothing');
+  assert.equal(await make({ write: null, exec: () => false })(), false, 'execCommand refused');
+  assert.equal(await make({ write: null, exec: () => true })(), true, 'execCommand on the visible, selected node');
+  assert.equal(await make({ write: async () => { throw new Error('x'); }, exec: () => true })(), true, 'falls back to execCommand when the API fails');
+  // the "copied" message is tied to the real outcome
+  assert.ok(/say\(msgEl, ok \? 'copied' : 'copySelected'\)/.test(app) && /await copyQuiet\(/.test(app));
+  const html = read('index.html');
+  assert.equal((html.match(/class="small-note copy-hint" hidden data-i18n="copyHint"/g) || []).length, 2, 'a hint above both command boxes');
+  assert.equal(STRINGS.zh.copyHint, '請按 Ctrl+C 複製');
+  const sm = /function showManual[\s\S]*?\n\}\n/.exec(app)[0];
+  assert.ok(/\.copy-hint/.test(sm) && /data-i18n-ok/.test(sm) && /selectNode\(node\)/.test(sm));
+  for (const k of ['manualTitleNoCopy', 'unHowNoCopy']) {
+    assert.ok(STRINGS.zh[k] && STRINGS.en[k], k);
+    assert.ok(!/已經複製好了|already copied/.test(STRINGS.zh[k] + STRINGS.en[k]), k + ' must not claim it was copied');
+  }
+  assert.ok(html.includes('data-i18n-fail="manualTitleNoCopy"') && html.includes('data-i18n-fail="unHowNoCopy"'));
+  // the notes that used to promise a copy now say "tries"
+  assert.ok(!/複製好|同時複製好/.test(STRINGS.zh.ocNote + STRINGS.zh.unOneNote) && !/is copied at the same moment/.test(STRINGS.en.ocNote + STRINGS.en.unOneNote));
+});
+
+test("a returning visitor sees last time's result and the fix section again, marked as such; a new measurement replaces it", () => {
+  const app = read('app.js'), html = read('index.html');
+  assert.ok(/S\.result = savedResult\(S\.last\)/.test(app), 'init rebuilds the result from the stored measurement');
+  assert.ok(/source: 'saved'/.test(app));
+  assert.equal(STRINGS.zh.savedResult, '上次量的結果（{date}）');
+  assert.ok(html.includes('id="rdSaved"') && html.includes('id="savedCaution"'));
+  assert.ok(/S\.result = \{ res, source: 'measured', remeasured \}/.test(app), 'a new measurement still replaces it');
+  assert.ok(/S\.result = null/.test(app), 'start over still clears it');
+  // renderAll shows result + fix whenever S.result exists, and the saved one carries theta / se / n
+  assert.ok(/const has = !!S\.result;/.test(app));
+  const fn = /function savedResult[\s\S]*?\n\}\n/.exec(app)[0];
+  assert.ok(/median: l\.theta/.test(fn) && /n: l\.n/.test(fn) && /se: /.test(fn));
 });

@@ -81,6 +81,19 @@ const signed = (v, d = 1) => {
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const reducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
+// After a reload the last valid measurement is shown again (marked "last time's result") so the fix can be applied
+// without measuring again. Only theta / se / n were kept; everything else stays empty and is not shown.
+function savedResult(l) {
+  const se = Number.isFinite(l.se) ? l.se : null;
+  const res = {
+    median: l.theta, weightedMedian: null, mean: null, std: null, pca: null, n: l.n, se: se == null ? 0 : se,
+    rightMedian: null, leftMedian: null, rightN: 0, leftN: 0, lrDiff: null,
+    confidence: se == null ? 'low' : A.confidenceLabel(se, l.n), warnings: [], strokes: [], hist: null
+  };
+  return { res, source: 'saved', remeasured: false };
+}
+const isSaved = () => !!S.result && S.result.source === 'saved';
+
 function theta() { return S.result && S.result.res.median != null ? S.result.res.median : null; }
 function canCopy() {
   return !!S.result && S.result.res.median != null;
@@ -212,6 +225,11 @@ function renderWedge(th, dim) {
 function renderResult() {
   const r = S.result, res = r.res;
   const th = res.median;
+  const savedTag = $('rdSaved');
+  savedTag.hidden = r.source !== 'saved';
+  if (!savedTag.hidden) { const d = shortDate(S.last && S.last.at); savedTag.textContent = t(d ? 'savedResult' : 'savedResultNoDate', { date: d }); }
+  $('savedCaution').hidden = !(r.source === 'saved' && S.pendingApply);
+  $('statsBox').hidden = r.source === 'saved';
   $('rdTheta').textContent = th == null ? '--' : signed(th) + '°';
   $('rdSe').textContent = th == null || res.n < 2 ? '' : '±' + num(res.se) + '°';
   let sentence;
@@ -271,7 +289,7 @@ function driverInactive() {
 // A gentle note when the swipes disagree (never blocks anything), the before/after numbers, and the driver hint.
 function renderHints() {
   const r = S.result;
-  $('shakyBox').hidden = !A.isShaky(r.res);
+  $('shakyBox').hidden = isSaved() || !A.isShaky(r.res);
   $('btnShaky').disabled = S.measuring;
   const show = S.mode === 'remeasure' && r.remeasured && r.res.confidence !== 'insufficient' && r.res.median != null;
   const ba = $('beforeAfter');
@@ -344,7 +362,7 @@ function renderBanner() {
 }
 
 function renderWelcome() {
-  const l = S.last, show = !!l && !S.result && !S.measuring;
+  const l = S.last, show = !!l && (!S.result || isSaved()) && !S.measuring;
   $('welcome').hidden = !show;
   if (!show) return;
   const date = shortDate(l.at);
@@ -365,8 +383,8 @@ function renderAll() {
     const r = S.result;
     $('padStatus').textContent = S.attempt
       ? t('statusNeedMore', { n: S.attempt.n, need: A.DEFAULTS.minStrokes })
-      : r ? t('statusDone', { n: r.res.n }) : t('statusIdle');
-    document.querySelector('.pad-cta').textContent = t(r ? 'padIdleDone' : 'padIdle');
+      : r && !isSaved() ? t('statusDone', { n: r.res.n }) : t('statusIdle');
+    document.querySelector('.pad-cta').textContent = t(r && !isSaved() ? 'padIdleDone' : 'padIdle');
   }
   drawPad();
 }
@@ -398,9 +416,15 @@ function renderBar() {
   document.body.classList.toggle('has-bar', bar);
 }
 
+// `select` = the copy did NOT work: pre-select the command, say "press Ctrl+C", and never claim it was copied.
 function showManual(boxId, node, select) {
   const box = $(boxId);
   box.hidden = false;
+  for (const el of box.querySelectorAll('[data-i18n-ok]')) {
+    el.dataset.i18n = select ? el.dataset.i18nFail : el.dataset.i18nOk;
+    el.textContent = t(el.dataset.i18n, DEFAULT_VARS());
+  }
+  for (const el of box.querySelectorAll('.copy-hint')) el.hidden = !select;
   box.classList.toggle('compact', S.installed);   // known to work before: smaller, but never hidden
   if (select && node) selectNode(node);
   if (box.scrollIntoView) box.scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'nearest' });
@@ -433,9 +457,17 @@ function doApply() {
   runLinkAction({ url, command: installCommand(rot), node: $('cmdInstall'), msgEl: $('oneClickMsg'), manualId: 'manualSteps' });
 }
 
+// The footer checkbox: also put Windows "Enhance pointer precision" back (checked by default).
+const restoreEpp = () => $('unRestoreEpp').checked;
+function refreshUninstall() {
+  $('cmdUninstall').textContent = uninstallCommand(restoreEpp());
+  $('unUrl').textContent = uninstallUrl(restoreEpp());
+}
+
 function doUninstall() {
   if (S.measuring) return;
-  runLinkAction({ url: uninstallUrl(), command: uninstallCommand(), node: $('cmdUninstall'), msgEl: $('oneClickUnMsg'), manualId: 'unManual' });
+  refreshUninstall();
+  runLinkAction({ url: uninstallUrl(restoreEpp()), command: uninstallCommand(restoreEpp()), node: $('cmdUninstall'), msgEl: $('oneClickUnMsg'), manualId: 'unManual' });
 }
 
 // -------------------------------------------------------------- copy helper
@@ -446,12 +478,22 @@ function selectNode(node) {
     return true;
   } catch { return false; }
 }
+// true ONLY when the text really was written: the promise is awaited, a rejection / exception / no answer in time
+// (a blocker such as uBlock Origin's clipboard protection, a denied permission) counts as "not copied".
+const CLIPBOARD_TIMEOUT_MS = 1500;
 async function copyQuiet(text, node) {
+  let timer = 0;
   try {
-    if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); return true; }
+    if (navigator.clipboard && window.isSecureContext) {
+      const slow = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('clipboard timeout')), CLIPBOARD_TIMEOUT_MS); });
+      await Promise.race([navigator.clipboard.writeText(text), slow]);
+      return true;
+    }
   } catch { /* fall through to selection */ }
+  finally { clearTimeout(timer); }
   try {
-    if (selectNode(node) && document.execCommand && document.execCommand('copy')) return true;
+    // execCommand needs a visible, selected node; a hidden one proves nothing
+    if (node && node.offsetParent !== null && selectNode(node) && document.execCommand && document.execCommand('copy')) return true;
   } catch { /* leave it selected */ }
   return false;
 }
@@ -720,7 +762,8 @@ function restartFresh() {
 function init() {
   load();
   // a returning visitor goes straight to re-measuring, compared with the last result
-  if (S.last) { S.mode = 'remeasure'; S.before = { theta: S.last.theta }; }
+  // and sees that result again (marked as last time's), so the fix works without measuring first
+  if (S.last) { S.mode = 'remeasure'; S.before = { theta: S.last.theta }; S.result = savedResult(S.last); }
 
   const isWin = /Windows/i.test(navigator.userAgent) || (navigator.userAgentData && navigator.userAgentData.platform === 'Windows');
   $('fix').dataset.first = isWin ? 'win' : 'phys';
@@ -751,7 +794,8 @@ function init() {
     if (ok) markPending('software'); else showManual('manualSteps', $('cmdInstall'), true);
   });
   $('btnCopyUninstall').addEventListener('click', async () => {
-    const ok = await copyText(uninstallCommand(), $('cmdUninstall'), $('copyUninstallMsg'));
+    refreshUninstall();
+    const ok = await copyText(uninstallCommand(restoreEpp()), $('cmdUninstall'), $('copyUninstallMsg'));
     if (ok) markPending('software'); else showManual('unManual', $('cmdUninstall'), true);
   });
   $('btnPickPhys').addEventListener('click', () => { markPending('physical'); say($('physPickMsg'), 'physPicked'); });
@@ -779,8 +823,8 @@ function init() {
   if (window.ResizeObserver) new ResizeObserver(() => { if (!S.measuring) drawPad(); }).observe(pad);
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', () => { renderAll(); });
   // uninstall lives in the footer and never depends on a measurement
-  $('cmdUninstall').textContent = uninstallCommand();
-  $('unUrl').textContent = uninstallUrl();
+  $('unRestoreEpp').addEventListener('change', refreshUninstall);
+  refreshUninstall();
   renderAll();
 }
 

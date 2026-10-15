@@ -27,10 +27,24 @@ $env:PSModulePath = Get-SafeModulePath $env:PSModulePath $false ($PSVersionTable
 # The URL-protocol registry key is redirected to a throw-away HKCU key and the folder-lock helper is a
 # no-op; this block is re-applied after every re-dot-source of setup.ps1 (which would reset both).
 $testKey = 'HKCU:\Software\mousecal-test-' +[guid]::NewGuid().ToString('N')
+# SAFETY (pointer precision): the mouse settings key is redirected to a throw-away HKCU key and the SPI_SETMOUSE call is a
+# recorder; Invoke-Spi (the raw P/Invoke) refuses everything except the read-only SPI_GETMOUSE. The real
+# HKCU:\Control Panel\Mouse values are snapshotted here and compared again at the very end.
+$testMouseKey = 'HKCU:\Software\mousecal-test-mouse-' + [guid]::NewGuid().ToString('N')
+function Get-RealMouseSnapshot { $k = Get-ItemProperty -LiteralPath 'HKCU:\Control Panel\Mouse'; return ('{0}|{1}|{2}' -f $k.MouseSpeed, $k.MouseThreshold1, $k.MouseThreshold2) }
+$realMouseBefore = Get-RealMouseSnapshot
+$script:spiCalls = @()
+$script:sameUser = $true
 $script:protectCalls = @()
 $script:aclCalls = @()
+$realInvokeSpi = ${function:Invoke-Spi}             # only ever called with SPI_GETMOUSE (3), see the guard below
+$realTestSame = ${function:Test-SameInteractiveUser}   # the stub below answers $script:sameUser; the real one is tested through this
 $applySafety = {
     $ProtocolKey = $testKey
+    $MouseKey = $testMouseKey
+    function Invoke-SpiSetMouse { param([int[]]$Values) $script:spiCalls += , @($Values) }
+    function Invoke-Spi { param([uint32]$Action, [int[]]$Values, [uint32]$Flags = 0) if ($Action -ne 3) { throw "SAFETY: the tests may only call the read-only SPI_GETMOUSE (got $Action)" }; & $realInvokeSpi $Action $Values $Flags }
+    function Test-SameInteractiveUser { param([string]$CurrentSid = '', [string[]]$ExplorerSids = $null) return [bool]$script:sameUser }
     function Protect-HandlerDir { param($Dir) $script:protectCalls += $Dir }
     function Invoke-Icacls { param([string[]]$IcaclsArgs) $script:aclCalls += , $IcaclsArgs; return @{ Code = 0; Out = '' } }
     function Set-ExactDacl { param([string]$Path) $script:aclCalls += , @($Path, 'EXACT-DACL') }
@@ -42,17 +56,22 @@ $realClearStale = ${function:Clear-StaleStaging}   # ditto (deletes .staging\* o
 $script:staleCalls = 0
 . $applySafety
 $hklmKeyBefore = Test-Path -LiteralPath 'HKLM:\SOFTWARE\Classes\mousecal'
-function Remove-TestKey { if (Test-Path -LiteralPath $testKey) { Remove-Item -LiteralPath $testKey -Recurse -Force -ErrorAction SilentlyContinue } }
+function Remove-TestKey {
+    if (Test-Path -LiteralPath $testKey) { Remove-Item -LiteralPath $testKey -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $testMouseKey) { Remove-Item -LiteralPath $testMouseKey -Recurse -Force -ErrorAction SilentlyContinue }
+}
 trap { Remove-TestKey; throw $_ }
 
 # ---- contract: functions exist
 foreach ($fn in 'Test-IsAdmin', 'Test-RotationValue', 'Test-ZipHash', 'Get-RunningAntiCheatGames', 'Set-RotationInJson',
                 'Backup-Settings', 'Register-ApplyTask', 'Install-RawAccelDriver', 'Invoke-Uninstall', 'Invoke-Main',
-                'Restart-MouseDevices', 'Test-DriverActive', 'ConvertTo-Degrees', 'Get-NewRotation', 'Expand-VerifiedZip', 'Get-RawAccelZipBytes', 'Test-ZipEntries') {
+                'Restart-MouseDevices', 'Test-DriverActive', 'ConvertTo-Degrees', 'Get-NewRotation', 'Expand-VerifiedZip', 'Get-RawAccelZipBytes', 'Test-ZipEntries',
+                'Get-PointerPrecision', 'Set-PointerPrecisionOff', 'Restore-PointerPrecision', 'Test-SameInteractiveUser') {
     Check "function $fn" ([bool](Get-Command $fn -CommandType Function -ErrorAction SilentlyContinue))
 }
 $params = (Get-Command $setupPath).Parameters
-foreach ($p in 'NoPause', 'Measured', 'Rotation', 'Uninstall', 'DryRun') { Check "parameter -$p" $params.ContainsKey($p) }
+foreach ($p in 'NoPause', 'Measured', 'Rotation', 'Uninstall', 'DryRun', 'RestorePointerPrecision') { Check "parameter -$p" $params.ContainsKey($p) }
+Check '-RestorePointerPrecision is a switch' ($params['RestorePointerPrecision'].SwitchParameter)
 Check '-Rotation / -Measured are strings' ($params['Rotation'].ParameterType -eq [string] -and $params['Measured'].ParameterType -eq [string])
 Check 'file is ASCII only' (-not ($src -match '[^\x00-\x7F]'))
 
@@ -98,6 +117,12 @@ Check '-Uninstall with -Measured -> 3' ((Test-Args '' '2' $true) -eq 3)
 $a = Test-Args '' '2.5' $false; Check '-Measured parsed' ($a.Kind -eq 'Measured' -and $a.Value -eq 2.5)
 $a = Test-Args '7' '' $false; Check '-Rotation parsed' ($a.Kind -eq 'Rotation' -and $a.Value -eq 7)
 $a = Test-Args '' '' $true; Check '-Uninstall alone ok' ($a.Kind -eq 'Uninstall')
+$Rotation = ''; $Measured = ''; $Uninstall = [switch]$false
+$RestorePointerPrecision = [switch]$true
+Check '-RestorePointerPrecision without -Uninstall -> 3' ((Test-Args '' '2' $false) -eq 3)
+Check '-RestorePointerPrecision with -Uninstall ok' ((Test-Args '' '' $true).Kind -eq 'Uninstall')
+$RestorePointerPrecision = [switch]$false
+Check 'no -RestorePointerPrecision: -Measured still parses' ((Test-Args '' '2' $false).Kind -eq 'Measured')
 $Rotation = ''; $Measured = ''; $Uninstall = [switch]$false
 
 # ---- F6: Format-Bi tolerates $null arguments
@@ -349,7 +374,19 @@ try {
         $r = Parse-Url $u
         Check "url ok: $u" ($r -and $r.Action -eq 'uninstall' -and -not $r.ContainsKey('Measured'))
     }
-    $bad = @('', 'mousecal://', 'mousecal://apply', 'mousecal://apply?', 'mousecal://apply?m=', 'mousecal://apply?x=1', 'mousecal://apply?m=8.2&x=1',
+    foreach ($u in 'mousecal://uninstall?epp=1', 'mousecal://uninstall/?epp=1', 'mousecal:uninstall?epp=1', 'MOUSECAL://UNINSTALL?epp=1', 'mousecal://uninstall?epp=1/') {
+        $r = Parse-Url $u
+        Check "url ok (restore): $u" ($r -and $r.Action -eq 'uninstall' -and $r.RestorePointerPrecision -eq $true -and -not $r.ContainsKey('Measured'))
+    }
+    foreach ($u in 'mousecal://uninstall?epp=0', 'mousecal://uninstall/?epp=0', 'mousecal://uninstall', 'mousecal:uninstall/') {
+        $r = Parse-Url $u
+        Check "url ok (no restore): $u" ($r -and $r.Action -eq 'uninstall' -and $r.RestorePointerPrecision -eq $false)
+    }
+    $bad = @('mousecal://uninstall?epp=2', 'mousecal://uninstall?epp=', 'mousecal://uninstall?epp', 'mousecal://uninstall?epp=11', 'mousecal://uninstall?epp=01', 'mousecal://uninstall?epp=true',
+             'mousecal://uninstall?EPP=1', 'mousecal://uninstall?epp=1&x=1', 'mousecal://uninstall?x=1&epp=1', 'mousecal://uninstall?epp=1&epp=0', 'mousecal://uninstall?epp==1', 'mousecal://uninstall?epp=-1',
+             'mousecal://uninstall?epp=1.0', 'mousecal://uninstall?epp=1;calc', 'mousecal://uninstall?epp=1 ', "mousecal://uninstall?epp=1`n", 'mousecal://uninstall?epp=1"', 'mousecal://uninstall?epp=%31',
+             'mousecal://uninstall/x?epp=1', 'mousecal://apply?epp=1', 'mousecal://apply?m=8.2&epp=1', 'mousecal://uninstall??epp=1', 'mousecal://uninstall?epp=1?epp=1',
+             '', 'mousecal://', 'mousecal://apply', 'mousecal://apply?', 'mousecal://apply?m=', 'mousecal://apply?x=1', 'mousecal://apply?m=8.2&x=1',
              'mousecal://apply?m=20.01', 'mousecal://apply?m=21', 'mousecal://apply?m=-21', 'mousecal://apply?m=100', 'mousecal://apply?m=1.234', 'mousecal://apply?m=1e1',
              'mousecal://apply?m=.5', 'mousecal://apply?m=5.', 'mousecal://apply?m=8,2', 'mousecal://apply?m=NaN', 'mousecal://apply?m=--1', 'mousecal://apply?m=+1',
              'mousecal://uninstall?m=1', 'mousecal://uninstall?', 'mousecal://other', 'mousecal://apply/extra?m=1', 'mousecal://applyx?m=1', 'http://apply?m=1', 'mousecal//apply?m=1', 'xmousecal://uninstall',
@@ -1359,6 +1396,232 @@ try {
         Check 'S5 Repair-ModulePath (not elevated) keeps the user folders' ($env:PSModulePath -match 'bob\\Documents\\WindowsPowerShell') $env:PSModulePath
     } finally { $env:PSModulePath = $pathBefore; function Test-IsAdmin { return $true } }
     Check 'S5 Invoke-MainCore repairs the path first and restores it at the end' ($src -match '(?s)function Invoke-MainCore.*?\$origModulePath = Repair-ModulePath.*?if \(\$origModulePath\) \{ \$env:PSModulePath = \$origModulePath \}')
+
+    # =====================================================================================
+    # Pointer precision ("Enhance pointer precision"). SAFETY: $MouseKey is a throw-away HKCU key and SPI_SETMOUSE is a
+    # recorder (see the block at the top); the real HKCU:\Control Panel\Mouse is compared with its snapshot at the end.
+    # =====================================================================================
+    . $setupPath
+    . $applySafety
+    . $r3Stubs
+    $ZipFilesText = $rows -join "`n"; $ZipSha256 = Get-BytesSha256 $fakeZip
+    $DryRun = [switch]$false; $RestorePointerPrecision = [switch]$false
+    $zhEpp = [regex]'指標選項'                  # 指標選項
+    function Set-TestMouse($s, $t1, $t2) {
+        New-Item -Path $testMouseKey -Force | Out-Null
+        foreach ($kv in @(@('MouseSpeed', $s), @('MouseThreshold1', $t1), @('MouseThreshold2', $t2))) {
+            if ($null -ne $kv[1]) { New-ItemProperty -LiteralPath $testMouseKey -Name $kv[0] -Value $kv[1] -PropertyType String -Force | Out-Null }
+        }
+    }
+    function Get-TestMouse {
+        if (-not (Test-Path -LiteralPath $testMouseKey)) { return 'none' }
+        $k = Get-Item -LiteralPath $testMouseKey
+        return ('{0}/{1}/{2}' -f $k.GetValue('MouseSpeed'), $k.GetValue('MouseThreshold1'), $k.GetValue('MouseThreshold2'))
+    }
+    function Get-TestMouseKinds { $k = Get-Item -LiteralPath $testMouseKey; return (('MouseSpeed', 'MouseThreshold1', 'MouseThreshold2' | ForEach-Object { [string]$k.GetValueKind($_) }) -join ',') }
+    function Get-LastSpi { if ($script:spiCalls.Count -eq 0) { return 'none' }; return ($script:spiCalls[$script:spiCalls.Count - 1] -join ',') }
+    function Clear-TestMouse { if (Test-Path -LiteralPath $testMouseKey) { Remove-Item -LiteralPath $testMouseKey -Recurse -Force }; $script:spiCalls = @() }
+    $ppJson = '"pointerPrecision":{"MouseSpeed":"1","MouseThreshold1":"6","MouseThreshold2":"10"}'
+
+    Check 'EPP SAFETY: $MouseKey is the throw-away key, not the real one' ($MouseKey -ceq $testMouseKey -and $MouseKey -ne 'HKCU:\Control Panel\Mouse')
+    Check 'EPP SAFETY: the real HKCU:\Control Panel\Mouse key is not under test' (-not $testMouseKey.Contains('Control Panel'))
+
+    # ---- Get-PointerPrecision / Test-PointerPrecisionOn
+    Clear-TestMouse
+    $g = Get-PointerPrecision
+    Check 'EPP Get: a missing key -> all $null, not "on"' ($null -eq $g.MouseSpeed -and $null -eq $g.MouseThreshold1 -and $null -eq $g.MouseThreshold2 -and -not (Test-PointerPrecisionOn $g))
+    Set-TestMouse '1' '6' '10'
+    $g = Get-PointerPrecision
+    Check 'EPP Get: reads the three strings' ($g.MouseSpeed -ceq '1' -and $g.MouseThreshold1 -ceq '6' -and $g.MouseThreshold2 -ceq '10' -and $g.MouseSpeed -is [string])
+    Check 'EPP Test-PointerPrecisionOn: 1 and 2 are on' ((Test-PointerPrecisionOn $g) -and (Test-PointerPrecisionOn ([pscustomobject]@{ MouseSpeed = '2' })))
+    Set-TestMouse '0' '0' '0'
+    Check 'EPP Test-PointerPrecisionOn: 0 is off' (-not (Test-PointerPrecisionOn (Get-PointerPrecision)))
+
+    # ---- Set-PointerPrecisionOff / Restore-PointerPrecision (registry values + the SPI call)
+    Clear-TestMouse; Set-TestMouse '1' '6' '10'
+    Set-PointerPrecisionOff
+    Check 'EPP Set-PointerPrecisionOff: all three values "0" (REG_SZ)' ((Get-TestMouse) -ceq '0/0/0' -and (Get-TestMouseKinds) -ceq 'String,String,String') "$(Get-TestMouse) $(Get-TestMouseKinds)"
+    Check 'EPP Set-PointerPrecisionOff: exactly one SPI_SETMOUSE call with int[3]{0,0,0}' ($script:spiCalls.Count -eq 1 -and (Get-LastSpi) -ceq '0,0,0')
+    $script:spiCalls = @()
+    Restore-PointerPrecision ([pscustomobject]@{ MouseSpeed = '1'; MouseThreshold1 = '6'; MouseThreshold2 = '10' })
+    Check 'EPP Restore-PointerPrecision: values written back as strings' ((Get-TestMouse) -ceq '1/6/10' -and (Get-TestMouseKinds) -ceq 'String,String,String')
+    Check 'EPP Restore-PointerPrecision: SPI array is { threshold1, threshold2, acceleration } = 6,10,1' ($script:spiCalls.Count -eq 1 -and (Get-LastSpi) -ceq '6,10,1') (Get-LastSpi)
+    $script:spiCalls = @(); Set-TestMouse '0' '0' '0'
+    foreach ($bad in @([pscustomobject]@{ MouseSpeed = '1;calc'; MouseThreshold1 = '6'; MouseThreshold2 = '10' }, [pscustomobject]@{ MouseSpeed = '1'; MouseThreshold1 = ''; MouseThreshold2 = '10' },
+                       [pscustomobject]@{ MouseSpeed = '1'; MouseThreshold1 = '6'; MouseThreshold2 = '-3' }, [pscustomobject]@{ MouseSpeed = '99999'; MouseThreshold1 = '6'; MouseThreshold2 = '10' }, [pscustomobject]@{ MouseSpeed = '1'; MouseThreshold1 = '6' })) {
+        Check "EPP Restore-PointerPrecision refuses unexpected values ($($bad.MouseSpeed)/$($bad.MouseThreshold1)/$($bad.MouseThreshold2))" ((Throws { Restore-PointerPrecision $bad }) -and (Get-TestMouse) -ceq '0/0/0' -and $script:spiCalls.Count -eq 0)
+    }
+    Check 'EPP Restore-PointerPrecision $null throws' (Throws { Restore-PointerPrecision $null })
+
+    # ---- the P/Invoke itself (in memory, no Add-Type); only the READ-ONLY SPI_GETMOUSE is ever called
+    $spi = Get-SpiMethod
+    Check 'EPP P/Invoke: SystemParametersInfoW(uint, uint, int[], uint) -> bool' ($spi.Name -ceq 'SystemParametersInfoW' -and (($spi.GetParameters() | ForEach-Object { $_.ParameterType.Name }) -join ',') -ceq 'UInt32,UInt32,Int32[],UInt32' -and $spi.ReturnType -eq [bool])
+    Check 'EPP P/Invoke: no Add-Type / no temp compilation in the source' ($src -notmatch '(?m)^\s*Add-Type .*MemberDefinition' -and $src -match 'DefinePInvokeMethod')
+    $probe = [int[]](99, 99, 99)
+    Invoke-Spi 3 $probe 0
+    $live = (Get-RealMouseSnapshot) -split '\|'
+    Check 'EPP P/Invoke: SPI_GETMOUSE (read-only) binds and fills { t1, t2, speed } like the real registry' ($probe -notcontains 99 -and $probe[2] -eq [int]$live[0] -and $probe[0] -eq [int]$live[1] -and $probe[1] -eq [int]$live[2]) ($probe -join ',')
+    Check 'EPP SAFETY: in the tests Invoke-Spi refuses SPI_SETMOUSE' (Throws { Invoke-Spi 4 ([int[]](0, 0, 0)) 3 })
+    Check 'EPP the SPI call uses SPI_SETMOUSE (4) with SPIF_UPDATEINIFILE|SPIF_SENDCHANGE (3)' ($src -match 'Invoke-Spi 4 \$Values 3')
+
+    # ---- Test-SameInteractiveUser (the real function; sids passed in)
+    Check 'EPP same user: one explorer, same SID -> true' ((& $realTestSame 'S-1-5-21-1' @('S-1-5-21-1')) -eq $true)
+    Check 'EPP same user: several explorers, all the same -> true' ((& $realTestSame 'S-1-5-21-1' @('S-1-5-21-1', 'S-1-5-21-1')) -eq $true)
+    Check 'EPP same user: explorer owned by someone else -> false' ((& $realTestSame 'S-1-5-21-1' @('S-1-5-21-2')) -eq $false)
+    Check 'EPP same user: one explorer is someone else''s -> false' ((& $realTestSame 'S-1-5-21-1' @('S-1-5-21-1', 'S-1-5-21-2')) -eq $false)
+    Check 'EPP same user: no explorer found -> false (cannot tell)' ((& $realTestSame 'S-1-5-21-1' @()) -eq $false)
+    Check 'EPP same user: empty strings do not count as explorers' ((& $realTestSame 'S-1-5-21-1' @('', $null)) -eq $false)
+    Check 'EPP same user: the current SID is a real SID' ((Get-CurrentUserSid) -match '^S-1-5-')
+    Check 'EPP same user: Get-ExplorerOwnerSids (read-only CIM query) returns SIDs of this session only' (@(Get-ExplorerOwnerSids | Where-Object { $_ -notmatch '^S-1-' }).Count -eq 0)
+    Check 'EPP same user: the real function answers a boolean from the live system' ((& $realTestSame) -is [bool])
+    Check 'EPP same user: uses Win32_Process + GetOwnerSid of explorer.exe in this session' ($src -match 'Win32_Process -Filter "Name = ''explorer\.exe''"' -and $src -match 'GetOwnerSid' -and $src -match 'SessionId')
+
+    # ---- marker: pointerPrecision round trip
+    $realMarker2 = $MarkerPath
+    $MarkerPath = Join-Path $sbRoot 'marker-epp'
+    Write-Marker @{ DriverInstalled = $true; AppDirCreated = $true; PointerPrecision = $null }
+    Check 'EPP marker: no saved values -> no pointerPrecision key, Read-Marker gives $null' (([IO.File]::ReadAllText($MarkerPath)) -notmatch 'pointerPrecision' -and $null -eq (Read-Marker).pointerPrecision)
+    Write-Marker @{ DriverInstalled = $true; AppDirCreated = $true; PointerPrecision = ([ordered]@{ MouseSpeed = '1'; MouseThreshold1 = '6'; MouseThreshold2 = '10' }) }
+    $txt = [IO.File]::ReadAllText($MarkerPath)
+    Check 'EPP marker: the JSON holds "pointerPrecision":{"MouseSpeed":"1","MouseThreshold1":"6","MouseThreshold2":"10"}' ($txt.Contains($ppJson)) $txt
+    $mk = Read-Marker
+    Check 'EPP marker: Read-Marker returns the three strings' ($mk.pointerPrecision.MouseSpeed -ceq '1' -and $mk.pointerPrecision.MouseThreshold1 -ceq '6' -and $mk.pointerPrecision.MouseThreshold2 -ceq '10' -and $mk.installedDriver -eq $true)
+    foreach ($badpp in '{"MouseSpeed":"x","MouseThreshold1":"6","MouseThreshold2":"10"}', '{"MouseSpeed":"1","MouseThreshold1":"6"}', '{"MouseSpeed":"1;calc","MouseThreshold1":"6","MouseThreshold2":"10"}', '"1/6/10"', '{"MouseSpeed":"","MouseThreshold1":"6","MouseThreshold2":"10"}') {
+        [IO.File]::WriteAllText($MarkerPath, '{"tool":"mousecal","installedDriver":true,"createdAppDir":true,"version":"1","pointerPrecision":' + $badpp + '}')
+        $mk = Read-Marker
+        Check "EPP marker: a malformed pointerPrecision is ignored ($badpp)" ($mk -and $mk.installedDriver -eq $true -and $null -eq $mk.pointerPrecision)
+    }
+    [IO.File]::WriteAllText($MarkerPath, '{"tool":"mousecal","installedDriver":true,"createdAppDir":true,"version":"1","pointerPrecision":{"MouseSpeed":1,"MouseThreshold1":6,"MouseThreshold2":10}}')
+    Check 'EPP marker: numbers (not strings) are accepted and normalised to strings' ((Read-Marker).pointerPrecision.MouseSpeed -ceq '1')
+    [IO.File]::WriteAllText($MarkerPath, 'mousecal')
+    Check 'EPP marker: the legacy plain-text marker has none' ($null -eq (Read-Marker).pointerPrecision)
+    $MarkerPath = $realMarker2
+
+    # ---- install flow (Invoke-Install with the full stub set): turn it off, save the originals, preserve them on re-runs
+    Check 'EPP install: Invoke-Install carries a saved value forward from the prior marker' ($src -match '(?s)function Invoke-Install.*?if \(\$prior -and \$prior\.pointerPrecision\) \{ \$tx\.PointerPrecision = \$prior\.pointerPrecision \}')
+    Check 'EPP install: the step runs inside the transaction (after Mutated, before the final apply), so a rollback covers it' ($src -match '(?s)\$tx\.Mutated = \$true.*?Disable-PointerPrecisionStep.*?# ---- 6\. apply now')
+    Check 'EPP install: Invoke-Rollback restores the values this run changed' ($src -match '(?s)function Invoke-Rollback.*?\$tx\.PointerChanged -and \$tx\.PointerBefore.*?Restore-PointerPrecision \$tx\.PointerBefore')
+    Clear-TestMouse; Set-TestMouse '1' '6' '10'; $script:sameUser = $true
+    New-Sandbox3
+    $r = Run-Install $mm
+    Check 'EPP install: succeeds' (-not $r.Threw) $r.Out
+    Check 'EPP install: EPP was on -> now 0/0/0 in the registry, applied live with {0,0,0}' ((Get-TestMouse) -ceq '0/0/0' -and (Get-LastSpi) -ceq '0,0,0' -and $script:spiCalls.Count -eq 1) "$(Get-TestMouse) spi=$($script:spiCalls.Count)"
+    $mtxt = [IO.File]::ReadAllText($script:MarkerPath)
+    Check 'EPP install: the marker holds the originals' ($mtxt.Contains($ppJson)) $mtxt
+    Check 'EPP install: the output says so in both languages' ($r.Out -match 'Enhance pointer precision" is now OFF' -and $r.Out -match [regex]'增強指標的精確度')
+    # re-run while it is already off: the saved original stays
+    $script:spiCalls = @()
+    $r = Run-Install $mm
+    Check 'EPP re-run (already off): the saved originals are kept, never overwritten with 0s' ((-not $r.Threw) -and ([IO.File]::ReadAllText($script:MarkerPath)).Contains($ppJson) -and $script:spiCalls.Count -eq 0 -and (Get-TestMouse) -ceq '0/0/0') ([IO.File]::ReadAllText($script:MarkerPath))
+    Check 'EPP re-run: says it is already off' ($r.Out -match 'already off')
+    # re-run after the user turned it on again with other values: the true original (first saved) stays
+    Set-TestMouse '2' '7' '11'
+    $r = Run-Install $mm
+    Check 'EPP re-run (turned on again as 2/7/11): turned off again, the FIRST saved original is still in the marker' ((-not $r.Threw) -and (Get-TestMouse) -ceq '0/0/0' -and ([IO.File]::ReadAllText($script:MarkerPath)).Contains($ppJson)) ([IO.File]::ReadAllText($script:MarkerPath))
+    # a rollback of a re-run puts back what that run found (2/7/11), and the old marker bytes
+    Set-TestMouse '2' '7' '11'; $script:spiCalls = @()
+    $before = [IO.File]::ReadAllText($script:MarkerPath); $script:writerExit = 1
+    $r = Run-Install $mm
+    Check 'EPP re-run that fails later: rolled back, registry back to 2/7/11 and applied live as 7,11,2' ($r.Threw -and (Get-TestMouse) -ceq '2/7/11' -and (Get-LastSpi) -ceq '7,11,2') "$($r.Threw) $(Get-TestMouse) $(Get-LastSpi)"
+    Check 'EPP re-run that fails later: the marker is exactly as before' ([IO.File]::ReadAllText($script:MarkerPath) -ceq $before)
+    # first install that fails later: rollback restores the original, marker removed
+    Clear-TestMouse; Set-TestMouse '1' '6' '10'; New-Sandbox3; $script:writerExit = 1
+    $r = Run-Install $mm
+    Check 'EPP first install that fails later: rollback restores 1/6/10 and applies it live as 6,10,1' ($r.Threw -and (Get-TestMouse) -ceq '1/6/10' -and (Get-LastSpi) -ceq '6,10,1') "$($r.Threw) $(Get-TestMouse) $(Get-LastSpi)"
+    Check 'EPP first install that fails later: no marker is left behind' (-not (Test-Path -LiteralPath $script:MarkerPath))
+    # EPP already off and no earlier record: nothing saved, nothing changed
+    Clear-TestMouse; Set-TestMouse '0' '0' '0'; New-Sandbox3
+    $r = Run-Install $mm
+    Check 'EPP already off (never on): no change, no SPI call, no pointerPrecision in the marker' ((-not $r.Threw) -and $script:spiCalls.Count -eq 0 -and ([IO.File]::ReadAllText($script:MarkerPath)) -notmatch 'pointerPrecision')
+    Clear-TestMouse; New-Sandbox3
+    $r = Run-Install $mm
+    Check 'EPP no mouse key at all: no change, no marker entry' ((-not $r.Threw) -and $script:spiCalls.Count -eq 0 -and -not (Test-Path -LiteralPath $testMouseKey) -and ([IO.File]::ReadAllText($script:MarkerPath)) -notmatch 'pointerPrecision')
+    # guard: a different interactive user
+    Clear-TestMouse; Set-TestMouse '1' '6' '10'; $script:sameUser = $false; New-Sandbox3
+    $r = $null; try { $r = @{ Threw = $false; Out = (Invoke-Install $mm *>&1 | Out-String -Width 5000) } } catch { $r = @{ Threw = $true; Out = $_.Exception.Message } }
+    Check 'EPP guard: another desktop user -> not touched, no SPI call, nothing in the marker' ((-not $r.Threw) -and (Get-TestMouse) -ceq '1/6/10' -and $script:spiCalls.Count -eq 0 -and ([IO.File]::ReadAllText($script:MarkerPath)) -notmatch 'pointerPrecision') $r.Out
+    Check 'EPP guard: the warning is bilingual and points to the mouse settings' (($r.Out -replace '\s+', ' ') -match 'NOT changed' -and ($r.Out -replace '\s+', '') -match $zhEpp -and ($r.Out -replace '\s+', '') -match [regex]'滑鼠設定')
+    $script:sameUser = $true
+    # SPI fails: the values go back, the marker does not keep an entry, the install itself still succeeds
+    Clear-TestMouse; Set-TestMouse '1' '6' '10'; New-Sandbox3
+    function Invoke-SpiSetMouse { param([int[]]$Values) throw 'spi boom' }
+    $r = Run-Install $mm
+    Check 'EPP SPI failure: install still succeeds, a warning is shown, registry back to 1/6/10, no marker entry' ((-not $r.Threw) -and $r.Out -match 'Could not turn off' -and (Get-TestMouse) -ceq '1/6/10' -and ([IO.File]::ReadAllText($script:MarkerPath)) -notmatch 'pointerPrecision') "$($r.Threw) $($r.Out) $(Get-TestMouse)"
+    . $applySafety     # the recorder again
+    # dry run: only prints
+    Clear-TestMouse; Set-TestMouse '1' '6' '10'; New-Sandbox3
+    $DryRun = [switch]$true
+    $r = Run-Install @{ Kind = 'Rotation'; Value = 3.0 }
+    $DryRun = [switch]$false
+    Check 'EPP -DryRun: prints the step, changes nothing' ((-not $r.Threw) -and ($r.Out -replace '\s+', ' ') -match 'Turn off Windows "Enhance pointer precision"' -and (Get-TestMouse) -ceq '1/6/10' -and $script:spiCalls.Count -eq 0 -and -not (Test-Path -LiteralPath $script:MarkerPath)) $r.Out
+
+    # ---- uninstall: restore only with -RestorePointerPrecision AND saved originals AND the same-user guard
+    function Run-Uninstall { try { $o = (Invoke-Uninstall *>&1 | Out-String -Width 5000); return @{ Threw = $false; Out = $o } } catch { return @{ Threw = $true; Out = $_.Exception.Message } } }
+    $mkPlain = '{"tool":"mousecal","installedDriver":false,"createdAppDir":false,"version":"1"}'
+    $mkSaved = '{"tool":"mousecal","installedDriver":false,"createdAppDir":false,"version":"1",' + $ppJson + '}'
+    function Reset-Un([string]$marker) { New-Sandbox3; Clear-TestMouse; Set-TestMouse '0' '0' '0'; if ($marker) { [IO.File]::WriteAllText($script:MarkerPath, $marker) } }
+    Reset-Un $mkSaved; $RestorePointerPrecision = [switch]$true
+    $r = Run-Uninstall
+    Check 'EPP uninstall -RestorePointerPrecision + saved: values written back and applied live as 6,10,1' ((-not $r.Threw) -and (Get-TestMouse) -ceq '1/6/10' -and (Get-LastSpi) -ceq '6,10,1' -and $script:spiCalls.Count -eq 1) "$($r.Out) $(Get-TestMouse)"
+    Check 'EPP uninstall: says it is back to the earlier setting; the marker is gone' ($r.Out -match 'is back to its earlier setting' -and -not (Test-Path -LiteralPath $script:MarkerPath))
+    $RestorePointerPrecision = [switch]$false
+    Reset-Un $mkSaved
+    $r = Run-Uninstall
+    Check 'EPP uninstall WITHOUT the switch: EPP stays as it is (off), no SPI call, and it says so' ((-not $r.Threw) -and (Get-TestMouse) -ceq '0/0/0' -and $script:spiCalls.Count -eq 0 -and ($r.Out -replace '\s+', ' ') -match 'stays off' -and ($r.Out -replace '\s+', '') -match $zhEpp) $r.Out
+    $RestorePointerPrecision = [switch]$true
+    Reset-Un $mkPlain
+    $r = Run-Uninstall
+    Check 'EPP uninstall with the switch but nothing saved: left as it is, and it says so' ((-not $r.Threw) -and (Get-TestMouse) -ceq '0/0/0' -and $script:spiCalls.Count -eq 0 -and ($r.Out -replace '\s+', ' ') -match 'left as it is') $r.Out
+    Reset-Un $null
+    $r = Run-Uninstall
+    Check 'EPP uninstall with the switch but no marker at all: left as it is' ((-not $r.Threw) -and (Get-TestMouse) -ceq '0/0/0' -and $script:spiCalls.Count -eq 0 -and ($r.Out -replace '\s+', ' ') -match 'left as it is')
+    Reset-Un $mkSaved; $script:sameUser = $false
+    $r = Run-Uninstall
+    Check 'EPP uninstall with the switch but another desktop user: not restored, warning, uninstall still finishes' ((-not $r.Threw) -and (Get-TestMouse) -ceq '0/0/0' -and $script:spiCalls.Count -eq 0 -and ($r.Out -replace '\s+', ' ') -match 'NOT restored' -and ($r.Out -replace '\s+', '') -match $zhEpp -and -not (Test-Path -LiteralPath $script:MarkerPath)) $r.Out
+    $script:sameUser = $true
+    Reset-Un $mkSaved; $DryRun = [switch]$true
+    $r = Run-Uninstall
+    $DryRun = [switch]$false
+    Check 'EPP uninstall -DryRun with the switch: only reports (nothing written, marker kept)' ((-not $r.Threw) -and (Get-TestMouse) -ceq '0/0/0' -and $script:spiCalls.Count -eq 0 -and ($r.Out -replace '\s+', ' ') -match 'Put "Enhance pointer precision" back' -and (Test-Path -LiteralPath $script:MarkerPath)) $r.Out
+    Reset-Un $mkSaved
+    function Invoke-SpiSetMouse { param([int[]]$Values) throw 'spi boom' }
+    $r = Run-Uninstall
+    Check 'EPP uninstall: a failing SPI call only warns (with the old values), the uninstall still finishes' ((-not $r.Threw) -and $r.Out -match 'Could not restore' -and $r.Out -match '1/6/10' -and -not (Test-Path -LiteralPath $script:MarkerPath)) $r.Out
+    . $applySafety
+    $RestorePointerPrecision = [switch]$false
+
+    # ---- the handler: ?epp=1 -> -Uninstall -RestorePointerPrecision, otherwise no restore
+    Check 'EPP handler: the VBS sanitiser is unchanged (same character class, 64 chars)' ($HandlerVbsText.Contains('re.Pattern = "^[A-Za-z0-9:/?=.&-]+$"') -and $HandlerVbsText.Contains('Len(url) > 64'))
+    Check 'EPP handler: the new link fits the VBS sanitiser' ([regex]::IsMatch('mousecal://uninstall?epp=1', '^[A-Za-z0-9:/?=.&-]+$') -and 'mousecal://uninstall?epp=1'.Length -le 64)
+    & {
+        $laBefore = $env:LOCALAPPDATA
+        $env:LOCALAPPDATA = Join-Path $sbRoot 'localappdata-epp'
+        try {
+            . (Join-Path $hd 'handler.ps1')
+            function Get-RunningAntiCheatGames { return @() }
+            function Show-Confirm { param($Text, $Title) $script:askText = $Text; return $true }
+            function Show-Info { param($Text, $Title, $Icon) }
+            function Show-Result { param($Code, $Action) }
+            function Invoke-Elevated { param($ScriptPath, $ScriptArgs) $script:elev = (@($ScriptArgs) -join ' '); return 0 }
+            foreach ($case in @(@('mousecal://uninstall?epp=1', '-Uninstall -RestorePointerPrecision -NoPause', $true), @('mousecal://uninstall?epp=0', '-Uninstall -NoPause', $false), @('mousecal://uninstall', '-Uninstall -NoPause', $false))) {
+                $script:elev = $null; $script:askText = $null
+                $rc = Invoke-HandlerMain $case[0]
+                Check "EPP handler: $($case[0]) -> elevated args '$($case[1])'" ($rc -eq 0 -and $script:elev -ceq $case[1]) "rc=$rc elev=$($script:elev)"
+                Check "EPP handler: $($case[0]) -> the confirmation $(if ($case[2]) { 'mentions' } else { 'does not mention' }) pointer precision" ([bool]($script:askText -match 'Enhance pointer precision') -eq $case[2])
+            }
+            foreach ($u in 'mousecal://uninstall?epp=2', 'mousecal://uninstall?epp=1&x=1', 'mousecal://apply?epp=1', 'mousecal://uninstall?x=1') {
+                $script:elev = $null
+                $rc = Invoke-HandlerMain $u
+                Check "EPP handler: $u is rejected (exit 3), nothing elevated" ($rc -eq 3 -and $null -eq $script:elev)
+            }
+        } finally { $env:LOCALAPPDATA = $laBefore }
+    }
+    Check 'EPP handler: every elevated argument still passes the strict argument check' ('-RestorePointerPrecision' -cmatch '^-?[A-Za-z0-9.]+\z' -and $HandlerPs1Text.Contains("'^-?[A-Za-z0-9.]+\z'"))
+
+    # ---- SAFETY: nothing above touched the real mouse settings
+    Remove-TestKey
+    Check 'EPP SAFETY: the real HKCU:\Control Panel\Mouse is exactly as before' ((Get-RealMouseSnapshot) -ceq $realMouseBefore) "$realMouseBefore -> $(Get-RealMouseSnapshot)"
+    Check 'EPP SAFETY: no test key is left behind' (-not (Test-Path -LiteralPath $testMouseKey))
 
     # ---- housekeeping
     $gi = [IO.File]::ReadAllText((Join-Path $here '..\.gitignore'))

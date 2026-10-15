@@ -1,7 +1,8 @@
 /*
  * Pure helpers for the per-browser convenience record and the link-launch decision. No DOM.
- * The record is NEVER used to compute a rotation: the install / apply command carries only
- * the angle measured in the current visit.
+ * The record only lets a returning visitor see (and apply) the last measurement again after a reload;
+ * the page marks it as "last time's result" and a new measurement replaces it. The install / apply
+ * command carries that one measured angle only; setup.ps1 adds it to the rotation the driver applies.
  */
 
 export const PATHS = ['software', 'physical'];

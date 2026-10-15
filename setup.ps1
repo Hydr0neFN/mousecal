@@ -10,6 +10,8 @@
                     is currently applying (read from the driver), or uses it as is if no driver runs.
   -Rotation <deg>   absolute rotation to set (manual use). Exactly one of the two is required.
   -Uninstall        removes only what this script installed.
+  -RestorePointerPrecision   with -Uninstall: also turns Windows "Enhance pointer precision" back to the value it had
+                    before the install (only when the install recorded it in the marker).
   -DryRun           downloads + verifies + validates in a temp folder, changes nothing else.
   -NoPause          (or $env:MOUSECAL_NO_PAUSE = '1') skips the final "press Enter" prompt.
 
@@ -32,12 +34,19 @@
   (only administrators can write there). The website's "one-click apply" / "one-click uninstall" buttons
   open mousecal://apply?m=<deg> and mousecal://uninstall; the handler validates the link, asks for
   confirmation, and only then re-runs the local copy of this script elevated. -Uninstall removes it all.
+  (mousecal://uninstall?epp=1 additionally passes -RestorePointerPrecision.)
+
+  Pointer precision: an install turns OFF Windows "Enhance pointer precision" (HKCU\Control Panel\Mouse MouseSpeed /
+  MouseThreshold1 / MouseThreshold2 = 0, applied live with SystemParametersInfo SPI_SETMOUSE) so games that read the cursor
+  instead of raw input get no acceleration. The original values are saved in the marker; a failed install puts them back;
+  -Uninstall -RestorePointerPrecision restores them. Skipped when the elevated user is not the signed-in desktop user.
 #>
 [CmdletBinding()]
 param(
     [string]$Rotation = '',
     [string]$Measured = '',
     [switch]$Uninstall,
+    [switch]$RestorePointerPrecision,
     [switch]$DryRun,
     [switch]$NoPause
 )
@@ -60,6 +69,7 @@ $TaskName     = 'RawAccel Apply Settings'
 $FilterKey    = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e96f-e325-11ce-bfc1-08002be10318}'
 $ServiceKey   = 'HKLM:\SYSTEM\CurrentControlSet\Services\rawaccel'
 $DriverSysPath = Join-Path $env:SystemRoot 'System32\drivers\rawaccel.sys'
+$MouseKey     = 'HKCU:\Control Panel\Mouse'                       # "Enhance pointer precision" (per user); tests redirect it to a throw-away key
 $ProtocolKey  = 'HKLM:\SOFTWARE\Classes\mousecal'                   # the mousecal:// URL protocol (one-click apply / uninstall)
 $script:StageDir     = $null
 $SetupMutexName = 'Global\mousecal-setup'                              # one real (non -DryRun) run at a time
@@ -974,7 +984,7 @@ sh.Run cmd, 0, False
 # shared helpers (game list, active rotation, bilingual text). Dot-source it with
 # $env:MOUSECAL_NO_MAIN = '1' to load the functions without running (tests).
 $HandlerPs1Text = @'
-# mousecal URL handler (installed by setup.ps1). Handles ONLY  mousecal://apply?m=<deg>  and  mousecal://uninstall.
+# mousecal URL handler (installed by setup.ps1). Handles ONLY  mousecal://apply?m=<deg>  and  mousecal://uninstall[?epp=0|1].
 # Every action is confirmed in a dialog first; the changes are made by the local setup.ps1 (next to this file,
 # writable by administrators only), started elevated through UAC. Nothing here is sent over the network.
 param([string]$Url = '')
@@ -996,7 +1006,8 @@ function Write-HandlerLog([string]$Text) {
     } catch { }
 }
 
-# -> @{ Action = 'apply'; Measured = [double] } or @{ Action = 'uninstall' }; throws on anything else.
+# -> @{ Action = 'apply'; Measured = [double] } or @{ Action = 'uninstall'; RestorePointerPrecision = [bool] }; throws on anything else.
+# uninstall takes nothing, or exactly  ?epp=1  (also put "Enhance pointer precision" back) / ?epp=0 (do not).
 # Browsers differ in how they hand over the link: mousecal://apply?m=8.2, mousecal://apply/?m=8.2,
 # mousecal:apply?m=8.2 are all accepted.
 function ConvertFrom-MousecalUrl([string]$Url) {
@@ -1006,8 +1017,8 @@ function ConvertFrom-MousecalUrl([string]$Url) {
     $q = $Matches['q']
     $hasQuery = $Url.Contains('?')
     if ($act -eq 'uninstall') {
-        if ($hasQuery) { throw 'uninstall takes no value' }
-        return @{ Action = 'uninstall' }
+        if ($hasQuery -and $q -cnotmatch '^epp=(?<e>[01])\z') { throw 'uninstall takes only epp=0 or epp=1' }
+        return @{ Action = 'uninstall'; RestorePointerPrecision = ($hasQuery -and $Matches['e'] -ceq '1') }
     }
     if (-not $hasQuery -or $q -cnotmatch '^m=(?<n>-?[0-9]{1,2}(\.[0-9]{1,2})?)\z') { throw 'apply needs m=<degrees>' }
     $d = 0.0
@@ -1113,7 +1124,7 @@ function Invoke-HandlerMain([string]$Url) {
             return 3
         }
         $isApply = ($req.Action -eq 'apply')
-        if ($isApply) { Write-HandlerLog ('apply requested, measured {0}' -f (Format-Rotation $req.Measured)) } else { Write-HandlerLog 'uninstall requested' }
+        if ($isApply) { Write-HandlerLog ('apply requested, measured {0}' -f (Format-Rotation $req.Measured)) } else { Write-HandlerLog ('uninstall requested (restore pointer precision: {0})' -f $(if ($req.RestorePointerPrecision) { 'yes' } else { 'no' })) }
         if (-not (Test-Path -LiteralPath $McSetup -PathType Leaf)) {
             Write-HandlerLog 'local setup.ps1 missing'
             Show-Info (Join-Bi 'The local mousecal files are missing. Use "First install" on the website, then try again.' '\u627e\u4e0d\u5230\u672c\u6a5f\u7684 mousecal \u6a94\u6848\u3002\u8acb\u5148\u4f7f\u7528\u7db2\u7ad9\u4e0a\u7684\u300c\u7b2c\u4e00\u6b21\u5b89\u88dd\u300d\uff0c\u518d\u8a66\u4e00\u6b21\u3002') 'mousecal' 'Warning'
@@ -1132,8 +1143,9 @@ function Invoke-HandlerMain([string]$Url) {
             $ask = Join-Bi 'Apply the measured correction? Current {0} deg -> new {1} deg (the measured {2} deg is added to the rotation that is active now). Pressing Yes opens the administrator (UAC) prompt next; pressing No changes nothing.' '\u8981\u5957\u7528\u525b\u91cf\u5230\u7684\u6821\u6b63\u55ce\uff1f\u76ee\u524d {0}\u00b0 -> \u65b0 {1}\u00b0\uff08\u628a\u91cf\u5230\u7684 {2}\u00b0 \u52a0\u5230\u76ee\u524d\u5957\u7528\u7684\u65cb\u8f49\u4e0a\uff09\u3002\u6309\u300c\u662f\u300d\u4e4b\u5f8c\u6703\u8df3\u51fa\u7cfb\u7d71\u7ba1\u7406\u54e1\uff08UAC\uff09\u78ba\u8a8d\u8996\u7a97\uff1b\u6309\u300c\u5426\u300d\u4e0d\u6703\u8b8a\u66f4\u4efb\u4f55\u6771\u897f\u3002' @((Format-Rotation $active), (Format-Rotation $new), (Format-Rotation $req.Measured))
             $elevArgs = @('-Rotation', (Format-Rotation $new), '-NoPause')
         } else {
-            $ask = Join-Bi 'Uninstall Raw Accel and the mouse rotation setup? Only what this tool installed is removed. Pressing Yes opens the administrator (UAC) prompt next; pressing No changes nothing.' '\u8981\u89e3\u9664\u5b89\u88dd Raw Accel \u8207\u6ed1\u9f20\u65cb\u8f49\u6821\u6b63\u55ce\uff1f\u53ea\u6703\u79fb\u9664\u9019\u500b\u5de5\u5177\u5b89\u88dd\u7684\u6771\u897f\u3002\u6309\u300c\u662f\u300d\u4e4b\u5f8c\u6703\u8df3\u51fa\u7cfb\u7d71\u7ba1\u7406\u54e1\uff08UAC\uff09\u78ba\u8a8d\u8996\u7a97\uff1b\u6309\u300c\u5426\u300d\u4e0d\u6703\u8b8a\u66f4\u4efb\u4f55\u6771\u897f\u3002'
+            $ask = Join-Bi 'Uninstall Raw Accel and the mouse rotation setup? Only what this tool installed is removed.{0} Pressing Yes opens the administrator (UAC) prompt next; pressing No changes nothing.' '\u8981\u89e3\u9664\u5b89\u88dd Raw Accel \u8207\u6ed1\u9f20\u65cb\u8f49\u6821\u6b63\u55ce\uff1f\u53ea\u6703\u79fb\u9664\u9019\u500b\u5de5\u5177\u5b89\u88dd\u7684\u6771\u897f\u3002{0}\u6309\u300c\u662f\u300d\u4e4b\u5f8c\u6703\u8df3\u51fa\u7cfb\u7d71\u7ba1\u7406\u54e1\uff08UAC\uff09\u78ba\u8a8d\u8996\u7a97\uff1b\u6309\u300c\u5426\u300d\u4e0d\u6703\u8b8a\u66f4\u4efb\u4f55\u6771\u897f\u3002' @($(if ($req.RestorePointerPrecision) { ' Windows "Enhance pointer precision" is also put back to its earlier setting.' } else { '' }), $(if ($req.RestorePointerPrecision) { '\u4e5f\u6703\u628a Windows \u7684\u300c\u589e\u5f37\u6307\u6a19\u7684\u7cbe\u78ba\u5ea6\u300d\u6539\u56de\u539f\u672c\u7684\u8a2d\u5b9a\u3002' } else { '' }))
             $elevArgs = @('-Uninstall', '-NoPause')
+            if ($req.RestorePointerPrecision) { $elevArgs = @('-Uninstall', '-RestorePointerPrecision', '-NoPause') }
         }
         if (-not (Show-Confirm $ask 'mousecal')) { Write-HandlerLog 'declined'; return 0 }
         $code = Invoke-Elevated $McSetup $elevArgs
@@ -1303,23 +1315,177 @@ function Write-Marker($Tx) {
     $o = [ordered]@{
         tool = 'mousecal'; installedDriver = [bool]($Tx.DriverInstalled -or $Tx.PriorDriver); createdAppDir = [bool]($Tx.AppDirCreated -or $Tx.PriorAppDir); version = '1'
     }
+    if ($Tx.PointerPrecision) {
+        $pp = $Tx.PointerPrecision
+        $o['pointerPrecision'] = [ordered]@{ MouseSpeed = [string]$pp.MouseSpeed; MouseThreshold1 = [string]$pp.MouseThreshold1; MouseThreshold2 = [string]$pp.MouseThreshold2 }
+    }
     $dir = Split-Path $MarkerPath
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     Write-Utf8NoBom $MarkerPath ((New-Object PSObject -Property $o | ConvertTo-Json -Compress))
 }
 # A marker is valid iff it parses as JSON with tool == "mousecal" (or is the legacy plain text
 # "mousecal", meaning installedDriver = createdAppDir = true). Returns an object with
-# installedDriver / createdAppDir, or $null.
+# installedDriver / createdAppDir / pointerPrecision (the saved "Enhance pointer precision" values, or $null), or $null.
 function Read-Marker {
     if (-not (Test-Path -LiteralPath $MarkerPath -PathType Leaf)) { return $null }
     $text = ''
     try { $text = [IO.File]::ReadAllText($MarkerPath).Trim() } catch { return $null }
-    if ($text -eq 'mousecal') { return (New-Object PSObject -Property ([ordered]@{ tool = 'mousecal'; installedDriver = $true; createdAppDir = $true; version = 'legacy' })) }
+    if ($text -eq 'mousecal') { return (New-Object PSObject -Property ([ordered]@{ tool = 'mousecal'; installedDriver = $true; createdAppDir = $true; version = 'legacy'; pointerPrecision = $null })) }
     try { $m = $text | ConvertFrom-Json } catch { return $null }
     if ($m -and $m.tool -eq 'mousecal') {
-        return (New-Object PSObject -Property ([ordered]@{ tool = 'mousecal'; installedDriver = ($m.installedDriver -eq $true); createdAppDir = ($m.createdAppDir -eq $true); version = [string]$m.version }))
+        $pp = $null
+        $mp = $m.pointerPrecision
+        if ($mp -and "$($mp.MouseSpeed)" -cmatch '^[0-9]{1,4}$' -and "$($mp.MouseThreshold1)" -cmatch '^[0-9]{1,4}$' -and "$($mp.MouseThreshold2)" -cmatch '^[0-9]{1,4}$') {
+            $pp = New-Object PSObject -Property ([ordered]@{ MouseSpeed = "$($mp.MouseSpeed)"; MouseThreshold1 = "$($mp.MouseThreshold1)"; MouseThreshold2 = "$($mp.MouseThreshold2)" })
+        }
+        return (New-Object PSObject -Property ([ordered]@{ tool = 'mousecal'; installedDriver = ($m.installedDriver -eq $true); createdAppDir = ($m.createdAppDir -eq $true); version = [string]$m.version; pointerPrecision = $pp }))
     }
     return $null
+}
+
+# --------------------------------------------- pointer precision ("Enhance pointer precision")
+# Windows' mouse acceleration is HKCU\Control Panel\Mouse: MouseSpeed (0 = off, 1/2 = on) with MouseThreshold1 /
+# MouseThreshold2. Games that read the cursor (not raw input) get that acceleration, which would spoil the
+# "measure first" result, so the install turns it off and saves the original values in the marker.
+# $MouseKey is a variable and the P/Invoke sits behind Invoke-SpiSetMouse so the tests can redirect both
+# (a throw-away registry key + a stub): they never touch the real mouse settings.
+function Get-PointerPrecision {
+    $v = [ordered]@{ MouseSpeed = $null; MouseThreshold1 = $null; MouseThreshold2 = $null }
+    try {
+        $p = Get-ItemProperty -LiteralPath $MouseKey -ErrorAction Stop
+        foreach ($n in @($v.Keys)) { if ($null -ne $p.$n) { $v[$n] = [string]$p.$n } }
+    } catch { }
+    return (New-Object PSObject -Property $v)
+}
+function Test-PointerPrecisionOn($Pp) { return ($null -ne $Pp -and $null -ne $Pp.MouseSpeed -and ([string]$Pp.MouseSpeed) -ne '0') }
+
+# SystemParametersInfoW through an in-memory P/Invoke (Reflection.Emit): unlike Add-Type nothing is compiled
+# into, or loaded from, a user-writable temp folder by this elevated process.
+function Get-SpiMethod {
+    if (-not $script:SpiMethod) {
+        $an = New-Object Reflection.AssemblyName 'MousecalNative'
+        $acc = [Reflection.Emit.AssemblyBuilderAccess]::Run
+        if ([Reflection.Emit.AssemblyBuilder].GetMethod('DefineDynamicAssembly', [Type[]]@([Reflection.AssemblyName], [Reflection.Emit.AssemblyBuilderAccess]))) { $ab = [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly($an, $acc) }      # PowerShell 7 (.NET)
+        else { $ab = [AppDomain]::CurrentDomain.DefineDynamicAssembly($an, $acc) }                                                                                                                                    # Windows PowerShell 5.1 (.NET Framework)
+        $tb = $ab.DefineDynamicModule('MousecalNative').DefineType('Spi', [Reflection.TypeAttributes]'Public,Class')
+        $mb = $tb.DefinePInvokeMethod('SystemParametersInfoW', 'user32.dll', [Reflection.MethodAttributes]'Public,Static,PinvokeImpl', [Reflection.CallingConventions]::Standard,
+            [bool], [Type[]]@([uint32], [uint32], [int[]], [uint32]), [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Unicode)
+        $mb.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
+        $script:SpiMethod = $tb.CreateType().GetMethod('SystemParametersInfoW')
+    }
+    return $script:SpiMethod
+}
+function Invoke-Spi([uint32]$Action, [int[]]$Values, [uint32]$Flags = 0) {
+    if (-not [bool](Get-SpiMethod).Invoke($null, @($Action, [uint32]0, $Values, $Flags))) { throw ('SystemParametersInfo({0}) failed' -f $Action) }
+}
+# SPI_SETMOUSE = 0x0004: pvParam = int[3] { threshold1, threshold2, acceleration }; SPIF_UPDATEINIFILE | SPIF_SENDCHANGE = 3
+function Invoke-SpiSetMouse([int[]]$Values) {
+    if (@($Values).Count -ne 3) { throw 'SPI_SETMOUSE needs exactly three values' }
+    Invoke-Spi 4 $Values 3
+}
+
+# Writes the three values (REG_SZ, like Windows does) and applies them to the running session.
+function Set-PointerValues([string]$Speed, [string]$T1, [string]$T2) {
+    foreach ($x in $Speed, $T1, $T2) { if ($x -cnotmatch '^[0-9]{1,4}$') { throw 'unexpected pointer value' } }
+    if (-not (Test-Path -LiteralPath $MouseKey)) { New-Item -Path $MouseKey -Force | Out-Null }
+    New-ItemProperty -LiteralPath $MouseKey -Name 'MouseSpeed' -Value $Speed -PropertyType String -Force | Out-Null
+    New-ItemProperty -LiteralPath $MouseKey -Name 'MouseThreshold1' -Value $T1 -PropertyType String -Force | Out-Null
+    New-ItemProperty -LiteralPath $MouseKey -Name 'MouseThreshold2' -Value $T2 -PropertyType String -Force | Out-Null
+    Invoke-SpiSetMouse @([int]$T1, [int]$T2, [int]$Speed)
+}
+function Set-PointerPrecisionOff { Set-PointerValues '0' '0' '0' }
+function Restore-PointerPrecision($Saved) {
+    if (-not $Saved) { throw 'no saved pointer settings' }
+    Set-PointerValues ([string]$Saved.MouseSpeed) ([string]$Saved.MouseThreshold1) ([string]$Saved.MouseThreshold2)
+}
+
+# The elevated process may change the desktop user's mouse settings only when it IS that user (someone who
+# typed an administrator's password into the UAC prompt would otherwise change the administrator's settings,
+# not their own): the token's user SID must equal the owner of every explorer.exe in this session.
+function Get-CurrentUserSid { return [Security.Principal.WindowsIdentity]::GetCurrent().User.Value }
+function Get-ExplorerOwnerSids {
+    if ($script:ExplorerSidsCache) { return $script:ExplorerSidsCache }     # one query per run
+    $sess = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    $sids = New-Object System.Collections.Generic.List[string]
+    try {
+        foreach ($p in @(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'explorer.exe'" -ErrorAction Stop)) {
+            if ([int]$p.SessionId -ne $sess) { continue }
+            $r = Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid -ErrorAction Stop
+            if ([int]$r.ReturnValue -eq 0 -and $r.Sid) { $sids.Add([string]$r.Sid) }
+        }
+    } catch { }
+    if ($sids.Count -gt 0) { $script:ExplorerSidsCache = $sids.ToArray() }
+    return $sids.ToArray()
+}
+function Test-SameInteractiveUser([string]$CurrentSid = '', [string[]]$ExplorerSids = $null) {
+    if (-not $CurrentSid) { $CurrentSid = Get-CurrentUserSid }
+    if ($null -eq $ExplorerSids) { $ExplorerSids = @(Get-ExplorerOwnerSids) }
+    $ex = @($ExplorerSids | Where-Object { $_ })
+    if (-not $CurrentSid -or $ex.Count -eq 0) { return $false }        # cannot tell -> do not touch the settings
+    foreach ($s in $ex) { if ($s -ne $CurrentSid) { return $false } }
+    return $true
+}
+
+# Install step (real run): turn Enhance pointer precision off, saving the originals in the marker first.
+# Never fatal: a failure here puts the old values back and only costs this one setting.
+function Disable-PointerPrecisionStep {
+    $tx = $script:Tx
+    $cur = Get-PointerPrecision
+    if (-not (Test-PointerPrecisionOn $cur)) {
+        Say 'Windows "Enhance pointer precision" is already off; nothing to change.' 'Windows \u7684\u300c\u589e\u5f37\u6307\u6a19\u7684\u7cbe\u78ba\u5ea6\u300d\u672c\u4f86\u5c31\u662f\u95dc\u9589\u7684\uff0c\u4e0d\u9700\u8981\u66f4\u52d5\u3002'
+        return
+    }
+    if (-not (Test-SameInteractiveUser)) {
+        Warn 'This window runs as a different user than the one signed in on this desktop, so "Enhance pointer precision" was NOT changed. Turn it off yourself: Mouse settings > Pointer Options > untick "Enhance pointer precision".' '\u9019\u500b\u8996\u7a97\u7684\u4f7f\u7528\u8005\u548c\u76ee\u524d\u767b\u5165\u684c\u9762\u7684\u4f7f\u7528\u8005\u4e0d\u540c\uff0c\u6240\u4ee5\u6c92\u6709\u66f4\u52d5\u300c\u589e\u5f37\u6307\u6a19\u7684\u7cbe\u78ba\u5ea6\u300d\u3002\u8acb\u81ea\u5df1\u95dc\u6389\uff1a\u6ed1\u9f20\u8a2d\u5b9a \u2192 \u6307\u6a19\u9078\u9805 \u2192 \u53d6\u6d88\u52fe\u9078\u300c\u589e\u5f37\u6307\u6a19\u7684\u7cbe\u78ba\u5ea6\u300d\u3002'
+        return
+    }
+    $orig = [ordered]@{ MouseSpeed = [string]$cur.MouseSpeed; MouseThreshold1 = $(if ($null -ne $cur.MouseThreshold1) { [string]$cur.MouseThreshold1 } else { '6' }); MouseThreshold2 = $(if ($null -ne $cur.MouseThreshold2) { [string]$cur.MouseThreshold2 } else { '10' }) }
+    foreach ($k in @($orig.Keys)) {
+        if ($orig[$k] -cnotmatch '^[0-9]{1,4}$') {
+            Warn 'Unexpected value in the pointer settings ({0}), so "Enhance pointer precision" was NOT changed. Turn it off yourself: Mouse settings > Pointer Options.' '\u6307\u6a19\u8a2d\u5b9a\u88e1\u6709\u7121\u6cd5\u8fa8\u8b58\u7684\u503c\uff08{0}\uff09\uff0c\u6240\u4ee5\u6c92\u6709\u66f4\u52d5\u300c\u589e\u5f37\u6307\u6a19\u7684\u7cbe\u78ba\u5ea6\u300d\u3002\u8acb\u81ea\u5df1\u95dc\u6389\uff1a\u6ed1\u9f20\u8a2d\u5b9a \u2192 \u6307\u6a19\u9078\u9805\u3002' @($k)
+            return
+        }
+    }
+    $tx.PointerBefore = $orig                         # what a rollback of THIS run puts back
+    $hadSaved = [bool]$tx.PointerPrecision
+    if (-not $hadSaved) { $tx.PointerPrecision = $orig; Write-Marker $tx }       # the true original is recorded first; an earlier saved one is never replaced
+    $tx.PointerChanged = $true
+    try {
+        Set-PointerPrecisionOff
+        Ok 'Windows "Enhance pointer precision" is now OFF (no mouse acceleration in Windows). The old setting is saved; uninstalling can put it back.' '\u5df2\u95dc\u9589 Windows \u7684\u300c\u589e\u5f37\u6307\u6a19\u7684\u7cbe\u78ba\u5ea6\u300d\uff08\u6ed1\u9f20\u52a0\u901f\uff09\u3002\u539f\u672c\u7684\u8a2d\u5b9a\u5df2\u8a18\u4e0b\u4f86\uff0c\u89e3\u9664\u5b89\u88dd\u6642\u53ef\u4ee5\u6539\u56de\u3002'
+    } catch {
+        $m = $_.Exception.Message
+        try { Restore-PointerPrecision $orig } catch { }
+        $tx.PointerChanged = $false
+        if (-not $hadSaved) { $tx.PointerPrecision = $null; Write-Marker $tx }
+        Warn 'Could not turn off "Enhance pointer precision" ({0}); it was left as it was. Turn it off yourself: Mouse settings > Pointer Options.' '\u7121\u6cd5\u95dc\u9589\u300c\u589e\u5f37\u6307\u6a19\u7684\u7cbe\u78ba\u5ea6\u300d\uff08{0}\uff09\uff0c\u5df2\u7dad\u6301\u539f\u6a23\u3002\u8acb\u81ea\u5df1\u95dc\u6389\uff1a\u6ed1\u9f20\u8a2d\u5b9a \u2192 \u6307\u6a19\u9078\u9805\u3002' @($m)
+    }
+}
+
+# Uninstall step: puts the saved originals back only when asked (-RestorePointerPrecision) and the marker has them.
+function Restore-PointerPrecisionStep($Marker) {
+    $saved = $null
+    if ($Marker) { $saved = $Marker.pointerPrecision }
+    if (-not $RestorePointerPrecision) {
+        if ($saved) { Say 'Windows "Enhance pointer precision" stays off (the install turned it off; you did not ask to restore it). To turn it back on: Mouse settings > Pointer Options.' 'Windows \u7684\u300c\u589e\u5f37\u6307\u6a19\u7684\u7cbe\u78ba\u5ea6\u300d\u7dad\u6301\u95dc\u9589\uff08\u662f\u5b89\u88dd\u6642\u95dc\u6389\u7684\uff0c\u4f60\u6c92\u6709\u8981\u6c42\u6539\u56de\uff09\u3002\u8981\u91cd\u65b0\u958b\u555f\uff1a\u6ed1\u9f20\u8a2d\u5b9a \u2192 \u6307\u6a19\u9078\u9805\u3002' }
+        return
+    }
+    if (-not $saved) {
+        Say 'No earlier "Enhance pointer precision" setting was recorded (it was already off, or the install is older), so it is left as it is.' '\u6c92\u6709\u8a18\u9304\u5230\u539f\u672c\u7684\u300c\u589e\u5f37\u6307\u6a19\u7684\u7cbe\u78ba\u5ea6\u300d\u8a2d\u5b9a\uff08\u539f\u672c\u5c31\u662f\u95dc\u9589\uff0c\u6216\u662f\u820a\u7248\u5b89\u88dd\u7684\uff09\uff0c\u6240\u4ee5\u7dad\u6301\u73fe\u72c0\u3002'
+        return
+    }
+    $txt = '{0}/{1}/{2}' -f $saved.MouseSpeed, $saved.MouseThreshold1, $saved.MouseThreshold2
+    if ($DryRun) { Dry 'Put "Enhance pointer precision" back to the value saved at install (MouseSpeed/MouseThreshold1/MouseThreshold2 = {0}) and apply it with SystemParametersInfo, if this window runs as the signed-in desktop user' '\u628a\u300c\u589e\u5f37\u6307\u6a19\u7684\u7cbe\u78ba\u5ea6\u300d\u6539\u56de\u5b89\u88dd\u6642\u8a18\u4e0b\u7684\u8a2d\u5b9a\uff08MouseSpeed\uff0fMouseThreshold1\uff0fMouseThreshold2 = {0}\uff09\uff0c\u4e26\u7528 SystemParametersInfo \u7acb\u5373\u5957\u7528\uff08\u524d\u63d0\u662f\u9019\u500b\u8996\u7a97\u7684\u4f7f\u7528\u8005\u5c31\u662f\u76ee\u524d\u767b\u5165\u684c\u9762\u7684\u4f7f\u7528\u8005\uff09' @($txt); return }
+    if (-not (Test-SameInteractiveUser)) {
+        Warn 'This window runs as a different user than the one signed in on this desktop, so "Enhance pointer precision" was NOT restored. Change it yourself: Mouse settings > Pointer Options.' '\u9019\u500b\u8996\u7a97\u7684\u4f7f\u7528\u8005\u548c\u76ee\u524d\u767b\u5165\u684c\u9762\u7684\u4f7f\u7528\u8005\u4e0d\u540c\uff0c\u6240\u4ee5\u6c92\u6709\u6539\u56de\u300c\u589e\u5f37\u6307\u6a19\u7684\u7cbe\u78ba\u5ea6\u300d\u3002\u8acb\u81ea\u5df1\u6539\uff1a\u6ed1\u9f20\u8a2d\u5b9a \u2192 \u6307\u6a19\u9078\u9805\u3002'
+        return
+    }
+    try {
+        Restore-PointerPrecision $saved
+        Ok 'Windows "Enhance pointer precision" is back to its earlier setting ({0}).' 'Windows \u7684\u300c\u589e\u5f37\u6307\u6a19\u7684\u7cbe\u78ba\u5ea6\u300d\u5df2\u6539\u56de\u539f\u672c\u7684\u8a2d\u5b9a\uff08{0}\uff09\u3002' @($txt)
+    } catch {
+        Warn 'Could not restore "Enhance pointer precision" ({0}). Change it yourself: Mouse settings > Pointer Options (it was {1}).' '\u7121\u6cd5\u6539\u56de\u300c\u589e\u5f37\u6307\u6a19\u7684\u7cbe\u78ba\u5ea6\u300d\uff08{0}\uff09\u3002\u8acb\u81ea\u5df1\u6539\uff1a\u6ed1\u9f20\u8a2d\u5b9a \u2192 \u6307\u6a19\u9078\u9805\uff08\u539f\u672c\u662f {1}\uff09\u3002' @($_.Exception.Message, $txt)
+    }
 }
 
 # Splits the files under $Dir into ones this tool owns (the pinned file list, settings.json
@@ -1353,6 +1519,7 @@ function New-Tx {
         SettingsExisted = $false; SettingsBytes = $null; SettingsWritten = $false; BackupPath = $null
         DriverInstalled = $false; PriorDriver = $false; PriorAppDir = $false; OrigMarkerBytes = $null; Overwritten = @(); OldTaskXml = $null; HadOldTask = $false; TaskRegistered = $false; OldVbsBytes = $null
         ProtocolRegistered = $false; PriorProtocol = $false; ProtocolSnapshot = $null; DevicesRestarted = $false
+        PointerPrecision = $null; PointerBefore = $null; PointerChanged = $false
     }
 }
 
@@ -1400,6 +1567,9 @@ function Invoke-Rollback {
         foreach ($f in $tx.CreatedFiles) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
         foreach ($o in $tx.Overwritten) {
             try { Copy-Item -LiteralPath $o.Backup -Destination $o.Dest -Force } catch { $problems.Add('restore ' + $o.Dest + ': ' + $_.Exception.Message) }
+        }
+        if ($tx.PointerChanged -and $tx.PointerBefore) {
+            try { Restore-PointerPrecision $tx.PointerBefore } catch { $problems.Add('pointer precision: ' + $_.Exception.Message) }
         }
         # the marker: put back exactly what was there before; delete it only if this run created it
         try {
@@ -1488,6 +1658,7 @@ function Assert-NoGameRunning {
 function Resolve-Arguments {
     $hasR = -not [string]::IsNullOrWhiteSpace([string]$Rotation)
     $hasM = -not [string]::IsNullOrWhiteSpace([string]$Measured)
+    if ($RestorePointerPrecision -and -not $Uninstall) { Fail '-RestorePointerPrecision only works together with -Uninstall.' '-RestorePointerPrecision \u53ea\u80fd\u548c -Uninstall \u4e00\u8d77\u4f7f\u7528\u3002' @() 3 }
     if ($Uninstall) {
         if ($hasR -or $hasM) { Fail 'Do not combine -Uninstall with -Rotation or -Measured.' '-Uninstall \u4e0d\u80fd\u548c -Rotation \u6216 -Measured \u4e00\u8d77\u4f7f\u7528\u3002' @() 3 }
         return @{ Kind = 'Uninstall'; Value = 0.0 }
@@ -1553,6 +1724,7 @@ function Invoke-Uninstall {
     if (-not $marker) {
         Remove-ApplyTask
         Remove-UrlProtocolStep
+        Restore-PointerPrecisionStep $null
         if ((Test-Path -LiteralPath $InstallRoot) -or (Test-RawAccelFilter)) {
             Warn 'No mousecal install marker found: this Raw Accel was not installed by this tool, so its driver and files are left alone. To remove it, use Raw Accel''s own uninstaller.exe (in its folder).' '\u627e\u4e0d\u5230 mousecal \u7684\u5b89\u88dd\u6a19\u8a18\uff1a\u9019\u4efd Raw Accel \u4e0d\u662f\u9019\u500b\u5de5\u5177\u88dd\u7684\uff0c\u6240\u4ee5\u9a45\u52d5\u7a0b\u5f0f\u548c\u6a94\u6848\u90fd\u4e0d\u52d5\u3002\u8981\u79fb\u9664\u8acb\u7528 Raw Accel \u8cc7\u6599\u593e\u88e1\u81ea\u5df1\u7684 uninstaller.exe\u3002'
         }
@@ -1584,6 +1756,7 @@ function Invoke-Uninstall {
     # the registry key is always ownership-checked (the marker does not record the protocol step); the handler
     # files sit inside our own install root, which the marker vouches for
     Remove-UrlProtocolStep -FilesOwned
+    Restore-PointerPrecisionStep $marker
 
     # --- files
     if ($marker.createdAppDir) {
@@ -1623,6 +1796,7 @@ function Invoke-Install($Arg) {
     # ownership from an earlier run (only a valid marker counts) is carried forward, never downgraded
     $prior = Read-Marker
     if ($prior) { $tx.PriorDriver = [bool]$prior.installedDriver; $tx.PriorAppDir = [bool]$prior.createdAppDir }
+    if ($prior -and $prior.pointerPrecision) { $tx.PointerPrecision = $prior.pointerPrecision }      # the saved originals are carried forward, never replaced (not even by the "0"s this tool sets)
     if (Test-Path -LiteralPath $MarkerPath -PathType Leaf) { try { $tx.OrigMarkerBytes = [IO.File]::ReadAllBytes($MarkerPath) } catch { } }
 
     Step 'Checking prerequisites' '\u6aa2\u67e5\u5148\u6c7a\u689d\u4ef6'
@@ -1742,6 +1916,7 @@ function Invoke-Install($Arg) {
         if ($oldTask) { Dry 'Replace the existing scheduled task "{0}" (an older version of this tool created it){1}' '\u53d6\u4ee3\u65e2\u6709\u7684\u5de5\u4f5c\u6392\u7a0b\u300c{0}\u300d\uff08\u9019\u500b\u5de5\u5177\u820a\u7248\u5efa\u7acb\u7684\uff09{1}' @($TaskName, $(if (Test-Path -LiteralPath $VbsPath) { ' and delete ' + $VbsPath } else { '' })) }
         Dry 'Register scheduled task "{0}": runs as SYSTEM (highest), at startup (delay 15 s) and at every logon (delay 10 s), 2 min limit -> "{1}" "{2}"' '\u8a3b\u518a\u5de5\u4f5c\u6392\u7a0b\u300c{0}\u300d\uff1a\u4ee5 SYSTEM\uff08\u6700\u9ad8\u6b0a\u9650\uff09\u57f7\u884c\uff0c\u958b\u6a5f\u5f8c\u5ef6\u9072 15 \u79d2\u3001\u6bcf\u6b21\u767b\u5165\u5f8c\u5ef6\u9072 10 \u79d2\uff0c\u9650\u6642 2 \u5206\u9418 -> "{1}" "{2}"' @($TaskName, (Join-Path $AppDir 'writer.exe'), $SettingsPath)
         Dry 'Register the mousecal:// URL protocol: write handler.vbs, handler.ps1 and a copy of this script to {0} (administrators + SYSTEM may write, Users read only); registry {1} (default "URL:mousecal Protocol", "URL Protocol" = "") with shell\open\command = {2}' '\u8a3b\u518a mousecal:// \u7db2\u5740\u901a\u8a0a\u5354\u5b9a\uff1a\u628a handler.vbs\u3001handler.ps1 \u548c\u9019\u500b\u8173\u672c\u7684\u526f\u672c\u5beb\u5230 {0}\uff08\u53ea\u6709\u7cfb\u7d71\u7ba1\u7406\u54e1\u8207 SYSTEM \u80fd\u4fee\u6539\uff0c\u4e00\u822c\u4f7f\u7528\u8005\u552f\u8b80\uff09\uff1b\u767b\u9304 {1}\uff08\u9810\u8a2d\u503c\u300cURL:mousecal Protocol\u300d\u3001\u300cURL Protocol\u300d=\u300c\u300d\uff09\uff0cshell\open\command = {2}' @((Get-HandlerDir), $ProtocolKey, (Get-ProtocolCommand))
+        Dry 'Turn off Windows "Enhance pointer precision" (HKCU Control Panel\Mouse: MouseSpeed, MouseThreshold1, MouseThreshold2 = 0, applied now with SystemParametersInfo SPI_SETMOUSE) when it is on and this window runs as the signed-in desktop user; the original values are saved in the marker (an earlier saved value is kept) and put back if setup fails' '\u95dc\u9589 Windows \u7684\u300c\u589e\u5f37\u6307\u6a19\u7684\u7cbe\u78ba\u5ea6\u300d\uff08HKCU Control Panel\Mouse\uff1aMouseSpeed\u3001MouseThreshold1\u3001MouseThreshold2 = 0\uff0c\u4e26\u7528 SystemParametersInfo SPI_SETMOUSE \u7acb\u5373\u5957\u7528\uff09\uff0c\u524d\u63d0\u662f\u5b83\u76ee\u524d\u662f\u958b\u555f\u7684\u3001\u4e14\u9019\u500b\u8996\u7a97\u7684\u4f7f\u7528\u8005\u5c31\u662f\u76ee\u524d\u767b\u5165\u684c\u9762\u7684\u4f7f\u7528\u8005\uff1b\u539f\u672c\u7684\u503c\u6703\u8a18\u5728\u6a19\u8a18\u6a94\u88e1\uff08\u5148\u524d\u5df2\u8a18\u4e0b\u7684\u503c\u6703\u4fdd\u7559\uff09\uff0c\u8a2d\u5b9a\u5931\u6557\u6642\u6703\u6539\u56de'
         Dry 'If no game runs: apply now with writer.exe (must exit 0, then the active rotation is read back); otherwise leave it to the next startup/logon' '\u5982\u679c\u6c92\u6709\u904a\u6232\u5728\u57f7\u884c\uff1a\u7acb\u5373\u7528 writer.exe \u5957\u7528\uff08\u7d50\u675f\u4ee3\u78bc\u5fc5\u9808\u662f 0\uff0c\u4e26\u8b80\u56de\u76ee\u524d\u65cb\u8f49\u78ba\u8a8d\uff09\uff1b\u5426\u5247\u7559\u7d66\u4e0b\u6b21\u958b\u6a5f\uff0f\u767b\u5165\u6642\u5957\u7528'
         Write-Host ''
         Say 'Dry run finished: download, every file hash, signature and settings validation all passed. Nothing was installed.' '\u8a66\u8dd1\u7d50\u675f\uff1a\u4e0b\u8f09\u3001\u6bcf\u500b\u6a94\u6848\u7684\u96dc\u6e4a\u503c\u3001\u7c3d\u7ae0\u8207\u8a2d\u5b9a\u9a57\u8b49\u90fd\u901a\u904e\u3002\u6c92\u6709\u5b89\u88dd\u4efb\u4f55\u6771\u897f\u3002' 'Green' ''
@@ -1857,6 +2032,10 @@ function Invoke-Install($Arg) {
             Warn 'Could not set up the one-click link ({0}). Everything else is installed; the copy-command method on the website keeps working.' '\u7121\u6cd5\u8a2d\u5b9a\u4e00\u9375\u9023\u7d50\uff08{0}\uff09\u3002\u5176\u4ed6\u90fd\u5df2\u5b89\u88dd\u5b8c\u6210\uff1b\u7db2\u7ad9\u4e0a\u300c\u8907\u88fd\u6307\u4ee4\u300d\u7684\u65b9\u6cd5\u4ecd\u7136\u53ef\u7528\u3002' @($_.Exception.Message)
             try { if (-not $tx.PriorProtocol) { Unregister-UrlProtocol -Owned } else { Restore-UrlProtocolSnapshot $tx.ProtocolSnapshot } } catch { }
         }
+
+        # ---- 5c. Windows "Enhance pointer precision" off (measure first); undone by a rollback
+        Step 'Mouse pointer precision' '\u6ed1\u9f20\u6307\u6a19\u7cbe\u78ba\u5ea6'
+        Disable-PointerPrecisionStep
 
         # ---- 6. apply now (never while a listed game runs)
         Write-Host ''

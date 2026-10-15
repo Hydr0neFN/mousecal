@@ -244,6 +244,10 @@ kbd {
 .disclose li { margin: 4px 0; }
 .disclose p { margin: 6px 0; }
 .uninstall { margin-top: 22px; padding-top: 14px; border-top: 1px solid var(--rule); }
+.check { display: flex; gap: 10px; align-items: flex-start; margin: 8px 0 10px; font-size: 14px; color: var(--ink); cursor: pointer; }
+.check input { width: 20px; height: 20px; margin: 1px 0 0; flex: none; }
+.copy-hint { font-weight: 700; color: var(--ink); }
+.saved-tag { margin: 0 0 6px; font: 500 14px/1.5 var(--font-mono); color: var(--ink-2); }
 .wedge-fig { margin: 0 0 8px; }
 #wedge { width: 100%; max-width: 300px; height: auto; display: block; }
 
