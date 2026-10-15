@@ -18,15 +18,20 @@ $setupPath = Join-Path $here '..\setup.ps1'
 . $setupPath
 $src = [IO.File]::ReadAllText($setupPath)
 
-# ---- SAFETY: nothing in this file may touch the real HKLM:\SOFTWARE\Classes\mousecal or run icacls.
+# ---- SAFETY: nothing in this file may touch the real HKLM:\SOFTWARE\Classes\mousecal or run icacls on a real
+# path. Invoke-Icacls (the only way setup.ps1 runs icacls) only records its arguments here; the one test that
+# runs the real tool does so on a throw-away folder under %TEMP% (see the round-3 section).
 # The URL-protocol registry key is redirected to a throw-away HKCU key and the folder-lock helper is a
 # no-op; this block is re-applied after every re-dot-source of setup.ps1 (which would reset both).
 $testKey = 'HKCU:\Software\mousecal-test-' +[guid]::NewGuid().ToString('N')
 $script:protectCalls = @()
+$script:aclCalls = @()
 $applySafety = {
     $ProtocolKey = $testKey
     function Protect-HandlerDir { param($Dir) $script:protectCalls += $Dir }
+    function Invoke-Icacls { param([string[]]$IcaclsArgs) $script:aclCalls += , $IcaclsArgs; return @{ Code = 0; Out = '' } }
 }
+$realInvokeIcacls = ${function:Invoke-Icacls}   # only ever used on the throw-away folder in the round-3 section
 . $applySafety
 $hklmKeyBefore = Test-Path -LiteralPath 'HKLM:\SOFTWARE\Classes\mousecal'
 function Remove-TestKey { if (Test-Path -LiteralPath $testKey) { Remove-Item -LiteralPath $testKey -Recurse -Force -ErrorAction SilentlyContinue } }
@@ -201,7 +206,7 @@ try {
     # ---- F1: staging path is admin-only Program Files in a real run, temp only in -DryRun
     $DryRun = [switch]$false
     $sp = Get-StagePath
-    Check 'real run stages under the install root' ($sp -eq (Join-Path $InstallRoot '.staging') -and -not $sp.StartsWith([IO.Path]::GetTempPath(), [StringComparison]::OrdinalIgnoreCase))
+    Check 'real run stages under the install root in a per-run .staging\<guid> folder' ($sp -match ('^(?i)' + [regex]::Escape((Join-Path $InstallRoot '.staging')) + '[\x5c][0-9a-f]{32}$') -and (Get-StagePath) -ne $sp -and -not $sp.StartsWith([IO.Path]::GetTempPath(), [StringComparison]::OrdinalIgnoreCase))
     $DryRun = [switch]$true
     Check 'dry run stages in temp' ((Get-StagePath).StartsWith([IO.Path]::GetTempPath(), [StringComparison]::OrdinalIgnoreCase))
     $DryRun = [switch]$false
@@ -520,7 +525,7 @@ try {
 # ---- structure checks for the install / uninstall wiring
 Check 'install registers the protocol inside the transaction, after the startup task, before the final apply' ($src -match '(?s)Register-ApplyTask \$SettingsPath.*?Register-UrlProtocol.*?\$writer = Join-Path')
 Check 'install marks the protocol for rollback BEFORE registering it' ($src -match '(?s)\$tx\.ProtocolRegistered = \$true.*?Register-UrlProtocol')
-Check 'rollback unregisters the protocol (unless it existed before this run)' ($src -match '(?s)function Invoke-Rollback.*?ProtocolRegistered -and -not \$tx\.PriorProtocol.*?Unregister-UrlProtocol')
+Check 'rollback unregisters the protocol (unless it existed before this run, then it restores the key)' ($src -match '(?s)function Invoke-Rollback.*?ProtocolRegistered.*?-not \$tx\.PriorProtocol\) \{ Unregister-UrlProtocol \}.*?Restore-UrlProtocolSnapshot')
 Check 'uninstall removes the protocol in both branches (marker / no marker)' ((([regex]::Matches($src, 'Remove-UrlProtocolStep')).Count) -ge 3)
 Check 'dry run prints the protocol registration' ($src -match "Dry 'Register the mousecal:// URL protocol")
 Check 'handler files are never made user-writable (read & execute only for Users)' ($src -match '\*S-1-5-32-545:\(OI\)\(CI\)RX' -and $src -notmatch '\*S-1-5-32-545:\(OI\)\(CI\)(F|M|W)')
@@ -559,7 +564,7 @@ try {
     function Register-ScheduledTask { }
     function Export-ScheduledTask { param($TaskName) return '<task/>' }
     function Restart-MouseDevices { param([switch]$All) return 0 }
-    function Get-MouseDevicesInError { return @() }
+    function Get-MouseDeviceStatus { return @{} }
     function Get-RunningAntiCheatGames { return @() }
     function Start-Process { param($FilePath, $ArgumentList, $WorkingDirectory, $WindowStyle, [switch]$Wait, [switch]$PassThru) return [pscustomobject]@{ ExitCode = $script:writerExit } }
     function Get-AuthenticodeSignature { param($LiteralPath) return [pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = 'CN=fake, O=Microsoft Corporation' } } }
@@ -774,6 +779,355 @@ try {
     $o = (Invoke-Uninstall *>&1 | Out-String)
     Check 'proto: uninstall with nothing registered says nothing about it' (($o -notmatch 'mousecal://') -and -not (Test-Path -LiteralPath $testKey))
     Check 'SAFETY: the real HKLM:\SOFTWARE\Classes\mousecal was not touched by this test run' ((Test-Path -LiteralPath 'HKLM:\SOFTWARE\Classes\mousecal') -eq $hklmKeyBefore)
+
+    # =====================================================================================
+    # Round-3 fixes. Start from the real functions again, then stub every system-changing one.
+    # =====================================================================================
+    . $setupPath
+    . $applySafety
+    $ZipFilesText = $rows -join "`n"; $ZipSha256 = Get-BytesSha256 $fakeZip
+    $DryRun = [switch]$false
+    $realInstallDriver = ${function:Install-RawAccelDriver}
+    $realGetActive = ${function:Get-ActiveRotation}
+    $realTestDriverActive = ${function:Test-DriverActive}
+    $MouseSettleSeconds = 0
+    Check 'R3 stub guard: Invoke-Icacls is the recorder, not the real tool' (${function:Invoke-Icacls}.ToString() -match 'aclCalls')
+
+    # ---- F3: differing profile rotations
+    Check 'F3 the driver query reports MIXED when profiles disagree' ($ActiveScript -match 'MIXED' -and $ActiveScript -match 'Write-Output \(.ROT ')
+    function Invoke-Ps51Script { param($t, $w, $n, $a) return $script:ps51Result }
+    $script:ps51Result = @{ Code = 0; Out = 'ROT 8' }
+    Check 'F3 equal profiles -> the rotation' ((Get-ActiveRotation 'd' 'w') -eq 8.0)
+    $script:ps51Result = @{ Code = 0; Out = 'MIXED 8 0 -3.5' }
+    $c = ThrowsCode { Get-ActiveRotation 'd' 'w' }
+    Check 'F3 differing profiles -> exit 3' ($c -eq 3) "code=$c"
+    try { Get-ActiveRotation 'd' 'w' } catch { $m = $_.Exception.Message }
+    Check 'F3 ... with a bilingual message that names the values and -Rotation' ($m -match '8, 0, -3\.5' -and $m -match '-Rotation' -and $m -match '[^\x00-\x7F]')
+    $script:ps51Result = @{ Code = 3; Out = 'ERROR: x' }
+    Check 'F3 an unreadable driver stays exit 1' ((ThrowsCode { Get-ActiveRotation 'd' 'w' }) -eq 1)
+    Remove-Item function:Invoke-Ps51Script
+    function Get-CimInstance { throw 'WMI down' }
+    function Get-ActiveRotation { param($a, $b) Fail 'mixed' 'mixed' @() 3 }
+    Check 'F3 the driver probe counts a MIXED answer as "driver is running"' ((Test-DriverActive 'C:\x' $sbRoot) -eq $true -and $script:DriverProbeFailed -eq $false)
+    function Get-ActiveRotation { param($a, $b) Fail 'nope' 'nope' @() 1 }
+    Check 'F3 ... but a plain read failure still is not' ((Test-DriverActive 'C:\x' $sbRoot) -eq $false -and $script:DriverProbeFailed -eq $true)
+    Remove-Item function:Get-CimInstance
+    Set-Item function:Get-ActiveRotation $realGetActive
+
+    # ---- F6: mouse regressions
+    $script:statusNow = @{}
+    function Get-MouseDeviceStatus { return $script:statusNow }
+    $script:statusNow = @{ 'A' = 'OK'; 'B' = 'Error' }
+    Check 'F6 nothing changed -> no regression' (@(Get-MouseRegressions @{ 'A' = 'OK'; 'B' = 'Error' }).Count -eq 0)
+    $script:statusNow = @{ 'A' = 'Error'; 'B' = 'Error' }
+    Check 'F6 OK before, not OK now -> regression (pre-existing broken B ignored)' ((@(Get-MouseRegressions @{ 'A' = 'OK'; 'B' = 'Error' }) -join ',') -eq 'A')
+    $script:statusNow = @{ 'B' = 'Error' }
+    Check 'F6 a device that is gone is not a regression' (@(Get-MouseRegressions @{ 'A' = 'OK'; 'B' = 'Error' }).Count -eq 0)
+    $script:statusNow = @{ 'A' = 'Unknown' }
+    Check 'F6 any non-OK status counts' ((@(Get-MouseRegressions @{ 'A' = 'OK' }) -join ',') -eq 'A')
+    Check 'F6 the install no longer uses the old Error-only baseline' ($src -notmatch 'Get-MouseDevicesInError|baselineBad')
+
+    # ---- F5: Protect-AppDir arguments (recorder)
+    function Show-Calls { return , @($script:aclCalls | ForEach-Object { $_ -join ' ' }) }
+    $fakeApp = Join-Path $sbRoot 'fake-app'; New-Item -ItemType Directory -Path $fakeApp | Out-Null
+    $script:aclCalls = @(); Protect-AppDir $fakeApp
+    $c = Show-Calls
+    Check 'F5 empty folder: owner + ACL only (nothing to reset)' ($c.Count -eq 2 -and $c[0] -match '/setowner \*S-1-5-32-544 /T' -and $c[1] -match '/inheritance:r /grant:r') ($c -join ' | ')
+    [IO.File]::WriteAllText((Join-Path $fakeApp 'writer.exe'), 'x')
+    $script:aclCalls = @(); Protect-AppDir $fakeApp
+    $c = Show-Calls
+    Check 'F5 ACL = SYSTEM F, Administrators F, Users RX by SID, inheritance removed' ($c[1] -ceq ($fakeApp + ' /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX')) $c[1]
+    Check 'F5 ... applied recursively: children reset to inherit it (/T)' ($c.Count -eq 3 -and $c[2] -ceq ((Join-Path $fakeApp '*') + ' /reset /T /C')) ($c -join ' | ')
+    Check 'F5 ... and everything below is owned by Administrators (/T)' ($c[0] -ceq ($fakeApp + ' /setowner *S-1-5-32-544 /T /C'))
+    $script:aclCalls = @(); Protect-AppDir $fakeApp -NoRecurse
+    $c = Show-Calls
+    Check 'F5 -NoRecurse: only the folder itself' ($c.Count -eq 1 -and $c[0] -match '/inheritance:r' -and $c[0] -notmatch '/T|/reset|/setowner')
+    Check 'F5 no entry ever gives Users more than read & execute' (-not ((Show-Calls) -match 'S-1-5-32-545:\(OI\)\(CI\)(F|M|W|RW)'))
+    function Invoke-Icacls { param([string[]]$IcaclsArgs) return @{ Code = 5; Out = 'Access is denied.' } }
+    Check 'F5 a failing icacls aborts with exit 1' ((ThrowsCode { Protect-AppDir $fakeApp }) -eq 1)
+    . $applySafety
+
+    # ---- F5: the real icacls on a throw-away folder (fake files, %TEMP% only; never a real path)
+    $aclRoot = Join-Path $sbRoot 'acl-real'
+    $realApp = Join-Path $aclRoot 'RawAccel\RawAccel'
+    New-Item -ItemType Directory -Path (Join-Path $realApp 'sub') -Force | Out-Null
+    foreach ($f in 'writer.exe', 'settings.json', 'sub\x.dll', 'user-added.txt') { [IO.File]::WriteAllText((Join-Path $realApp $f), 'x') }
+    $mySid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $unsafe = [Security.AccessControl.FileSystemRights]'WriteData, AppendData, WriteAttributes, WriteExtendedAttributes, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
+    function Get-TestAcl([string]$p) {
+        if (Get-Command Get-Acl -ErrorAction SilentlyContinue) { return (Get-Acl -LiteralPath $p) }
+        return (Get-Item -LiteralPath $p -Force).GetAccessControl()
+    }
+    try {
+        # the situation seen on a real PC: pre-existing user Full control, explicit and for a single user, on files too
+        $null = & icacls.exe $realApp '/inheritance:e' '/grant' '*S-1-5-32-545:(OI)(CI)F' '/T' '/C'
+        $null = & icacls.exe (Join-Path $realApp 'settings.json') '/grant' ('*' + $mySid + ':F')
+        $null = & icacls.exe (Join-Path $realApp 'sub\x.dll') '/grant' '*S-1-1-0:F'
+        $before = Get-TestAcl (Join-Path $realApp 'settings.json')
+        Check 'F5 setup of the scenario: Users (and Everyone) really had write access first' (@($before.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-32-545' -and ($_.FileSystemRights -band $unsafe) }).Count -gt 0)
+        function Invoke-Icacls { param([string[]]$IcaclsArgs) $script:aclCalls += , $IcaclsArgs; if ($IcaclsArgs -contains '/setowner') { return @{ Code = 0; Out = 'skipped: needs an elevated token' } }; return (& $realInvokeIcacls -IcaclsArgs $IcaclsArgs) }
+        $script:aclCalls = @()
+        Protect-AppDir $realApp
+        . $applySafety      # back to the recorder
+        $okAll = $true; $why = @()
+        foreach ($f in '', 'writer.exe', 'settings.json', 'sub', 'sub\x.dll', 'user-added.txt') {
+            $p = if ($f) { Join-Path $realApp $f } else { $realApp }
+            $rules = @((Get-TestAcl $p).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object { $_.AccessControlType -eq 'Allow' })
+            foreach ($rule in $rules) {
+                $sid = $rule.IdentityReference.Value
+                if (@('S-1-5-18', 'S-1-5-32-544', 'S-1-5-32-545') -notcontains $sid) { $okAll = $false; $why += "$f has an ACE for $sid" }
+                elseif ($sid -eq 'S-1-5-32-545' -and ($rule.FileSystemRights -band $unsafe)) { $okAll = $false; $why += "$f lets Users write ($($rule.FileSystemRights))" }
+            }
+            foreach ($need in 'S-1-5-18', 'S-1-5-32-544') {
+                if (-not (@($rules | Where-Object { $_.IdentityReference.Value -eq $need -and ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl }).Count)) { $okAll = $false; $why += "$f lacks full control for $need" }
+            }
+            if (-not (@($rules | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-32-545' -and ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::ReadAndExecute) -eq [Security.AccessControl.FileSystemRights]::ReadAndExecute }).Count)) { $okAll = $false; $why += "$f lacks Users read/execute" }
+        }
+        Check 'F5 real icacls: every file and folder is SYSTEM/Administrators full + Users read/execute only (no user-specific or Everyone entries)' $okAll ($why -join '; ')
+        Check 'F5 real icacls: the folder no longer inherits' ((Get-TestAcl $realApp).AreAccessRulesProtected)
+    } finally {
+        . $applySafety
+        $null = & icacls.exe $realApp '/grant:r' ('*' + $mySid + ':(OI)(CI)F') '/T' '/C'   # throw-away folder: give the cleanup access back
+        Remove-Item -LiteralPath $aclRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Check 'F5 real icacls test folder cleaned up' (-not (Test-Path -LiteralPath $aclRoot))
+
+    # ---- F1: one real run at a time (named mutex; TEST_MOCK name so the real one is never involved)
+    $mxName = 'Global\TEST_MOCK_mousecal-' + [guid]::NewGuid().ToString('N')
+    function Start-Holder([string]$name) {
+        $ready = New-Object Threading.ManualResetEvent $false
+        $release = New-Object Threading.ManualResetEvent $false
+        $ps = [powershell]::Create()
+        [void]$ps.AddScript({ param($sp, $n, $ready, $release) $env:MOUSECAL_NO_MAIN = '1'; . $sp; $m = Enter-SetupLock $n; [void]$ready.Set(); if ($m) { [void]$release.WaitOne(30000); Exit-SetupLock $m; 'held' } else { 'busy' } }).AddArgument($setupPath).AddArgument($name).AddArgument($ready).AddArgument($release)
+        $h = $ps.BeginInvoke()
+        [void]$ready.WaitOne(30000)
+        return @{ PS = $ps; Handle = $h; Release = $release }
+    }
+    function Stop-Holder($h) { [void]$h.Release.Set(); $o = @($h.PS.EndInvoke($h.Handle)); $h.PS.Dispose(); return [string]$o[0] }
+    Check 'F1 the real name is Global\mousecal-setup' ($SetupMutexName -ceq 'Global\mousecal-setup')
+    $m1 = Enter-SetupLock $mxName
+    Check 'F1 a free lock is taken' ($null -ne $m1)
+    $h = Start-Holder $mxName
+    $res = Stop-Holder $h
+    Check 'F1 a second run (other thread) cannot take it' ($res -eq 'busy') $res
+    Exit-SetupLock $m1
+    $h = Start-Holder $mxName
+    $res = Stop-Holder $h
+    Check 'F1 after release the next run can' ($res -eq 'held') $res
+    # Invoke-MainCore: held -> bilingual message, exit 1, nothing run; free -> runs; dry run ignores the lock
+    $SetupMutexName = $mxName
+    function Test-IsAdmin { return $true }
+    function Get-RunningAntiCheatGames { return @() }
+    function Get-RunningVanguard { return @() }
+    $script:installRan = 0
+    function Invoke-Install { param($a) $script:installRan++; return 0 }
+    $Rotation = '1'
+    $h = Start-Holder $mxName
+    $all = @(Invoke-MainCore 6>&1)
+    $rc = @($all | Where-Object { $_ -is [int] }); $txt = ($all | Where-Object { $_ -isnot [int] } | Out-String)
+    Check 'F1 locked -> exit 1, the install did not run' ($rc.Count -eq 1 -and $rc[0] -eq 1 -and $script:installRan -eq 0) ("rc=$rc ran=$($script:installRan)")
+    Check 'F1 locked -> bilingual "another mousecal setup is running"' ($txt -match 'Another mousecal setup is running' -and $txt -match '[^\x00-\x7F]')
+    $DryRun = [switch]$true
+    $all = @(Invoke-MainCore 6>&1)
+    $DryRun = [switch]$false
+    Check 'F1 -DryRun does not take or need the lock' ($script:installRan -eq 1)
+    $null = Stop-Holder $h
+    $all = @(Invoke-MainCore 6>&1)
+    $rc = @($all | Where-Object { $_ -is [int] })
+    Check 'F1 lock free -> the run happens' ($rc[0] -eq 0 -and $script:installRan -eq 2)
+    $h = Start-Holder $mxName
+    $res = Stop-Holder $h
+    Check 'F1 ... and the run released the lock afterwards' ($res -eq 'held') $res
+    Check 'F1 the lock is taken only for real runs and released in finally' ($src -match '(?s)if \(-not \$DryRun\) \{\s*\$script:SetupLock = Enter-SetupLock' -and $src -match '(?s)finally \{.*?Exit-SetupLock \$script:SetupLock')
+    $Rotation = ''
+    . $setupPath; . $applySafety
+    $ZipFilesText = $rows -join "`n"; $ZipSha256 = Get-BytesSha256 $fakeZip
+
+    # ---- F1: per-run staging folder
+    $script:InstallRoot = Join-Path $sbRoot 'stg\RawAccel'; $script:Tx = $null
+    $script:aclCalls = @()
+    $sa = New-StageDir; $sb2 = New-StageDir
+    Check 'F1 two runs get two different .staging\<guid> folders' ($sa -ne $sb2 -and (Test-Path $sa) -and (Test-Path $sb2) -and (Split-Path -Leaf (Split-Path -Parent $sa)) -eq '.staging' -and (Split-Path -Leaf $sa) -match '^[0-9a-f]{32}$')
+    $c = Show-Calls
+    Check 'F1 .staging and the run folder are both locked to Administrators + SYSTEM' ($c.Count -eq 4 -and (@($c | Where-Object { $_ -match '/inheritance:r /grant:r \*S-1-5-32-544:\(OI\)\(CI\)F \*S-1-5-18:\(OI\)\(CI\)F$' }).Count -eq 4)) ($c -join ' | ')
+    $script:StageDir = $sa; Remove-StageDir
+    Check 'F1 cleanup removes only its own folder' (-not (Test-Path $sa) -and (Test-Path $sb2) -and (Test-Path (Split-Path -Parent $sb2)))
+    $script:StageDir = $sb2; Remove-StageDir
+    Check 'F1 ... and the empty .staging parent at the end' (-not (Test-Path (Split-Path -Parent $sb2)))
+    $script:StageDir = $null
+
+    # ---- F4 / F7 / hidden elevation: handler.ps1 and handler.vbs
+    $hd = Join-Path $sbRoot 'hnd'; New-Item -ItemType Directory -Path $hd | Out-Null
+    [IO.File]::WriteAllBytes((Join-Path $hd 'handler.ps1'), (ConvertTo-HandlerBytes $HandlerPs1Text $true))
+    [IO.File]::WriteAllText((Join-Path $hd 'setup.ps1'), '# dummy')
+    Check 'F4 handler log is per user (LOCALAPPDATA), not ProgramData' ($HandlerPs1Text -match 'env:LOCALAPPDATA' -and $HandlerPs1Text -notmatch 'ProgramData')
+    & {
+        $laBefore = $env:LOCALAPPDATA
+        $env:LOCALAPPDATA = Join-Path $sbRoot 'localappdata'
+        try {
+            . (Join-Path $hd 'handler.ps1')
+            Check 'F4 $McLog = %LOCALAPPDATA%\mousecal\handler.log' ($McLog -ceq (Join-Path $env:LOCALAPPDATA 'mousecal\handler.log'))
+            Write-HandlerLog 'probe'
+            Check 'F4 the log is written there' ((Test-Path $McLog) -and ([IO.File]::ReadAllText($McLog) -match 'probe'))
+            function Start-Process { param($FilePath, $ArgumentList, $Verb, $WindowStyle, [switch]$Wait, [switch]$PassThru) $script:spArgs = @{ File = $FilePath; Args = $ArgumentList; Verb = $Verb; Style = $WindowStyle }; return [pscustomobject]@{ ExitCode = 0 } }
+            $script:spArgs = $null
+            $rc = Invoke-Elevated (Join-Path $McDir 'setup.ps1') @('-Rotation', '1', '-NoPause')
+            Check 'F2 the elevated Start-Process is RunAs and -WindowStyle Hidden' ($rc -eq 0 -and $script:spArgs.Verb -eq 'RunAs' -and $script:spArgs.Style -eq 'Hidden' -and $script:spArgs.Args -match '-File ".*setup\.ps1" -Rotation 1 -NoPause') ($script:spArgs | Out-String)
+            $fr = Join-Path $sbRoot 'fakewin'; New-Item -ItemType Directory -Path (Join-Path $fr 'Sysnative\WindowsPowerShell\v1.0') -Force | Out-Null
+            Check 'F7 64-bit host -> System32 powershell' ((Get-HandlerPowerShell $true $fr) -ceq (Join-Path $fr 'System32\WindowsPowerShell\v1.0\powershell.exe'))
+            Check '... 32-bit host without Sysnative -> System32' ((Get-HandlerPowerShell $false $fr) -ceq (Join-Path $fr 'System32\WindowsPowerShell\v1.0\powershell.exe'))
+            [IO.File]::WriteAllText((Join-Path $fr 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'), 'x')
+            Check 'F7 32-bit host with Sysnative -> Sysnative powershell' ((Get-HandlerPowerShell $false $fr) -ceq (Join-Path $fr 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'))
+            Check 'F7 Invoke-Elevated uses Get-HandlerPowerShell' ($HandlerPs1Text -match 'Get-HandlerPowerShell' -and $script:spArgs.File -match 'System32')
+        } finally { $env:LOCALAPPDATA = $laBefore }
+    }
+    # handler.vbs: 64-bit and 32-bit cscript (printing instead of running)
+    $vt = $HandlerVbsText.Replace('sh.Run cmd, 0, False', 'WScript.StdOut.WriteLine cmd')
+    $vp = Join-Path $hd 'handler-r3.vbs'; [IO.File]::WriteAllText($vp, $vt, [Text.Encoding]::ASCII)
+    function Run-Cscript([string]$exe) {
+        $psi = New-Object Diagnostics.ProcessStartInfo; $psi.FileName = $exe; $psi.Arguments = '//Nologo "' + $vp + '" "mousecal://uninstall"'
+        $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.CreateNoWindow = $true
+        $p = [Diagnostics.Process]::Start($psi); $o = $p.StandardOutput.ReadToEnd(); $p.WaitForExit(); return $o.Trim()
+    }
+    Check 'F7 vbs text: tries Sysnative first, falls back to System32' ($HandlerVbsText -match 'Sysnative' -and $HandlerVbsText -match 'FileExists' -and $HandlerVbsText -match 'System32\\WindowsPowerShell')
+    $o64 = Run-Cscript (Join-Path $env:SystemRoot 'System32\cscript.exe')
+    Check 'F7 64-bit wscript -> System32 powershell' ($o64 -match '^"[^"]*\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe" -NoProfile') $o64
+    $c32 = Join-Path $env:SystemRoot 'SysWOW64\cscript.exe'
+    if (Test-Path $c32) {
+        $o32 = Run-Cscript $c32
+        Check 'F7 32-bit wscript -> Sysnative (64-bit) powershell' ($o32 -match '^"[^"]*\\Sysnative\\WindowsPowerShell\\v1\.0\\powershell\.exe" -NoProfile') $o32
+    }
+
+    # ---- coordinator P1: rollback restores a pre-existing protocol key exactly
+    $snapKey = $testKey + '-snap'
+    Remove-Item -LiteralPath $snapKey -Recurse -Force -ErrorAction SilentlyContinue
+    Check 'P1 snapshot of a missing key is $null; restoring $null removes a key' ($null -eq (Get-UrlProtocolSnapshot $snapKey))
+    New-Item -Path ($snapKey + '\shell\open\command') -Force | Out-Null
+    Set-Item -LiteralPath $snapKey -Value 'URL:old'; New-ItemProperty -LiteralPath $snapKey -Name 'URL Protocol' -Value 'x' -PropertyType String -Force | Out-Null
+    Set-Item -LiteralPath ($snapKey + '\shell\open\command') -Value '"C:\old\wscript.exe" "C:\old\handler.vbs" "%1"'
+    $sn = Get-UrlProtocolSnapshot $snapKey
+    Set-Item -LiteralPath $snapKey -Value 'changed'; Remove-ItemProperty -LiteralPath $snapKey -Name 'URL Protocol'
+    Set-Item -LiteralPath ($snapKey + '\shell\open\command') -Value 'changed'
+    Restore-UrlProtocolSnapshot $sn $snapKey
+    $k = Get-Item -LiteralPath $snapKey; $kc = Get-Item -LiteralPath ($snapKey + '\shell\open\command')
+    Check 'P1 snapshot/restore round trip: default, URL Protocol, command' ($k.GetValue('') -ceq 'URL:old' -and $k.GetValue('URL Protocol') -ceq 'x' -and $kc.GetValue('') -ceq '"C:\old\wscript.exe" "C:\old\handler.vbs" "%1"')
+    Restore-UrlProtocolSnapshot $null $snapKey
+    Check 'P1 restoring $null removes the key' (-not (Test-Path -LiteralPath $snapKey))
+
+    # ---- flows with the full stub set
+    $r3Stubs = {
+        function Get-RawAccelZipBytes { return , $fakeZip }
+        function New-StageDir { $p = Join-Path (Join-Path $script:InstallRoot '.staging') 'run'; New-Item -ItemType Directory $p -Force | Out-Null; return $p }
+        function Test-DriverActive { param($a, $b) $script:DriverProbeFailed = $false; $script:daCalls++; if ($script:daSeq.Count -ge $script:daCalls) { return [bool]$script:daSeq[$script:daCalls - 1] }; return $true }
+        function Get-ActiveRotation { param($a, $b) if ($script:rotMixed) { Fail 'mixed' 'mixed' @() 3 }; return 8.0 }
+        function Test-RawAccelFilter { return $true }
+        function Install-RawAccelDriver { param($d) return $false }
+        function Get-ScheduledTask { param($TaskName, $ErrorAction) return [pscustomobject]@{ TaskName = 'x' } }
+        function Register-ApplyTask { param($s) $script:calls.Register++ }
+        function Unregister-ScheduledTask { param($TaskName, $Confirm, $ErrorAction) $script:calls.Unregister++ }
+        function Register-ScheduledTask { }
+        function Export-ScheduledTask { param($TaskName) return '<task/>' }
+        function Restart-MouseDevices { param([switch]$All) $script:restarted = $true; return 1 }
+        function Get-MouseDeviceStatus { if ($script:restarted) { return $script:miceAfter }; return $script:miceBefore }
+        function Get-RunningAntiCheatGames { return @() }
+        function Start-Process { param($FilePath, $ArgumentList, $WorkingDirectory, $WindowStyle, [switch]$Wait, [switch]$PassThru) return [pscustomobject]@{ ExitCode = $script:writerExit } }
+        function Get-AuthenticodeSignature { param($LiteralPath) return [pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = 'CN=fake, O=Microsoft Corporation' } } }
+        function Test-SettingsJson { param($d, $j, $w) }
+        function Invoke-DriverTool { param($Exe, $Mode, $TimeoutSec) $script:calls.Tool++; return @{ Ok = $script:toolOk; Output = 'stub' } }
+        function Invoke-Icacls { param([string[]]$IcaclsArgs) $script:aclCalls += , $IcaclsArgs; $script:aclState += , @{ Writer = (Test-Path (Join-Path $script:AppDir 'writer.exe')); Settings = (Test-Path $script:SettingsPath) }; return @{ Code = 0; Out = '' } }
+    }
+    . $r3Stubs
+    function New-Sandbox3 { New-Sandbox; $script:daSeq = @(); $script:daCalls = 0; $script:rotMixed = $false; $script:restarted = $false; $script:miceBefore = @{}; $script:miceAfter = @{}; $script:aclCalls = @(); $script:aclState = @(); $script:rpt = 0 }
+    $script:daSeq = @(); $script:daCalls = 0; $script:rotMixed = $false; $script:restarted = $false; $script:miceBefore = @{}; $script:miceAfter = @{}; $script:aclState = @()
+
+    # F5 in the install flow: locked before the first copy, again after settings.json
+    New-Sandbox3
+    $r = Run-Install $mm
+    Check 'F5 flow: the install succeeds with the stubs' (-not $r.Threw) $r.Out
+    $c = Show-Calls
+    Check 'F5 flow: the install root is locked non-recursively' ($c[0] -ceq ($script:InstallRoot + ' /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX'))
+    $iApp = @(0..($script:aclCalls.Count - 1) | Where-Object { $script:aclCalls[$_][0] -eq $script:AppDir -and $script:aclCalls[$_] -contains '/inheritance:r' })
+    Check 'F5 flow: the app dir is locked twice (before the copy, after settings.json)' ($iApp.Count -eq 2) ($c -join ' | ')
+    Check 'F5 flow: first lock happens before writer.exe exists' ($script:aclState[$iApp[0]].Writer -eq $false)
+    Check 'F5 flow: second lock happens after settings.json was written' ($script:aclState[$iApp[1]].Settings -eq $true)
+    Check 'F5 flow: the second lock also resets the files that exist by then (/reset /T)' (@($c | Where-Object { $_ -ceq ((Join-Path $script:AppDir '*') + ' /reset /T /C') }).Count -ge 1)
+    Check 'F5 flow: Users never get more than read & execute' (-not (($c -join ' ') -match 'S-1-5-32-545:\(OI\)\(CI\)(F|M|W|RW)'))
+    Check 'F5 flow: the handler folder lock is also recursive (via Protect-AppDir)' ($src -match 'function Protect-HandlerDir\(\[string\]\$Dir\) \{ Protect-AppDir \$Dir \}')
+    Check 'F5 flow: dry run lists the lock' ($src -match "Dry 'Lock \{0\} \(non-recursive\)")
+
+    # F3 in the install flow
+    New-Sandbox3; Seed-Prior $oldMarker; $script:rotMixed = $true
+    $r = Run-Install $mm
+    Check 'F3 flow: -Measured with differing profile rotations -> exit 3' ($r.Threw -and $r.Code -eq 3) "$($r.Code) $($r.Out)"
+    Check 'F3 flow: nothing was changed (no ACL change, files, task, marker)' ($script:aclCalls.Count -eq 0 -and [IO.File]::ReadAllText((Join-Path $script:AppDir 'writer.exe')) -eq 'OLD-WRITER' -and [IO.File]::ReadAllText($script:MarkerPath) -eq $oldMarker -and $script:calls.Register -eq 0)
+    $DryRun = [switch]$true
+    $r = Run-Install $mm
+    $DryRun = [switch]$false
+    Check 'F3 flow: -DryRun -Measured refuses too' ($r.Threw -and $r.Code -eq 3) "$($r.Code)"
+    $r = Run-Install @{ Kind = 'Rotation'; Value = 3.0 }
+    Check 'F3 flow: -Rotation (absolute) is still allowed' ((-not $r.Threw) -and [IO.File]::ReadAllText($script:SettingsPath) -match '"Degrees of rotation": 3.0,') $r.Out
+
+    # F6 in the install flow
+    $script:MouseSettleSeconds = 0
+    New-Sandbox3; $script:daSeq = @($false, $false, $true); $script:miceBefore = @{ 'HID\A' = 'OK'; 'HID\B' = 'Error' }; $script:miceAfter = @{ 'HID\A' = 'Error'; 'HID\B' = 'Error' }
+    $r = Run-Install $mm
+    Check 'F6 flow: a mouse that was OK and is not, with the driver "Running" -> exit 8' ($r.Threw -and $r.Code -eq 8 -and $r.Out -match 'HID\\A') "$($r.Code) $($r.Out)"
+    Check 'F6 flow: ... and everything is rolled back' (-not (Test-Path $script:SettingsPath) -and -not (Test-Path $script:MarkerPath) -and $script:calls.Register -eq 0)
+    New-Sandbox3; $script:daSeq = @($false, $false, $true); $script:miceBefore = @{ 'HID\A' = 'OK'; 'HID\B' = 'Error' }; $script:miceAfter = @{ 'HID\A' = 'OK'; 'HID\B' = 'Error' }
+    $r = Run-Install $mm
+    Check 'F6 flow: a mouse that was already broken is ignored' (-not $r.Threw) "$($r.Code) $($r.Out)"
+    New-Sandbox3; $script:daSeq = @($false, $false, $true); $script:miceBefore = @{ 'HID\A' = 'OK' }; $script:miceAfter = @{}
+    $r = Run-Install $mm
+    Check 'F6 flow: a mouse that is no longer present is ignored (unplugged)' (-not $r.Threw) "$($r.Code) $($r.Out)"
+
+    # F2: the marker says installedDriver=true BEFORE installer.exe runs
+    Set-Item function:Install-RawAccelDriver $realInstallDriver
+    function Test-RawAccelFilter { return $false }
+    function Assert-PinnedFile { param($Path, $Rel) }
+    $script:markerSeen = $null
+    function Invoke-DriverTool { param($Exe, $Mode, $TimeoutSec) $script:markerSeen = [IO.File]::ReadAllText($script:MarkerPath); return @{ Ok = $script:toolOk; Output = 'stub' } }
+    New-Sandbox3; $script:Tx = New-Tx
+    $ran = Install-RawAccelDriver (Join-Path $sbRoot 'stage')
+    $mk = $script:markerSeen | ConvertFrom-Json
+    Check 'F2 installer.exe starts only after the marker holds installedDriver=true' ($ran -eq $true -and $mk.installedDriver -eq $true -and $mk.tool -eq 'mousecal') $script:markerSeen
+    $script:markerSeen = $null; $script:toolOk = $false; $script:Tx = New-Tx
+    $c = ThrowsCode { Install-RawAccelDriver (Join-Path $sbRoot 'stage') }
+    Check 'F2 a failing installer: exit 8, marker already says installedDriver (rollback undoes it)' ($c -eq 8 -and ([IO.File]::ReadAllText($script:MarkerPath) | ConvertFrom-Json).installedDriver -eq $true -and $script:Tx.DriverInstalled -eq $true)
+    $script:toolOk = $true; $script:Tx = $null
+    Check 'F2 structure: Write-Marker comes before Invoke-DriverTool in Install-RawAccelDriver' ($src -match '(?s)function Install-RawAccelDriver.*?DriverInstalled = \$true.*?Write-Marker \$script:Tx.*?Invoke-DriverTool \$exe')
+    . $r3Stubs   # full stub set again (Install-RawAccelDriver etc.)
+    function Invoke-DriverTool { param($Exe, $Mode, $TimeoutSec) $script:calls.Tool++; return @{ Ok = $script:toolOk; Output = 'stub' } }
+
+    # P1: a failed re-run restores a pre-existing protocol key exactly; a fresh failed install removes it
+    function Hd { return (Join-Path $script:InstallRoot 'mousecal') }
+    Remove-TestKey
+    $oldCmd = '"C:\old\wscript.exe" "C:\old\handler.vbs" "%1"'
+    New-Item -Path ($testKey + '\shell\open\command') -Force | Out-Null
+    Set-Item -LiteralPath $testKey -Value 'URL:old protocol'
+    New-ItemProperty -LiteralPath $testKey -Name 'URL Protocol' -Value 'old-marker' -PropertyType String -Force | Out-Null
+    Set-Item -LiteralPath ($testKey + '\shell\open\command') -Value $oldCmd
+    New-Sandbox3; Seed-Prior $oldMarker; $script:writerExit = 1
+    $r = Run-Install $mm
+    $k = Get-Item -LiteralPath $testKey; $kc = Get-Item -LiteralPath ($testKey + '\shell\open\command')
+    Check 'P1 failed re-run: default value restored exactly' ($r.Threw -and $k.GetValue('') -ceq 'URL:old protocol') $r.Out
+    Check 'P1 failed re-run: "URL Protocol" restored exactly' ($k.GetValue('URL Protocol') -ceq 'old-marker')
+    Check 'P1 failed re-run: shell\open\command restored exactly' ($kc.GetValue('') -ceq $oldCmd) ($kc.GetValue(''))
+    Remove-TestKey
+    New-Item -Path $testKey -Force | Out-Null; Set-Item -LiteralPath $testKey -Value 'URL:only default'
+    New-Sandbox3; Seed-Prior $oldMarker; $script:writerExit = 1
+    $r = Run-Install $mm
+    $k = Get-Item -LiteralPath $testKey
+    Check 'P1 failed re-run over a bare key: values the run added are removed again' ($r.Threw -and $k.GetValue('') -ceq 'URL:only default' -and ($k.GetValueNames() -notcontains 'URL Protocol') -and -not (Test-Path -LiteralPath ($testKey + '\shell')))
+    Remove-TestKey
+    New-Sandbox3; Seed-Prior $oldMarker; $script:writerExit = 1
+    $r = Run-Install $mm
+    Check 'P1 fresh failed install still removes the key' ($r.Threw -and -not (Test-Path -LiteralPath $testKey))
+    New-Item -Path ($testKey + '\shell\open\command') -Force | Out-Null; Set-Item -LiteralPath ($testKey + '\shell\open\command') -Value $oldCmd
+    New-Sandbox3; Seed-Prior $oldMarker; $script:writerExit = 0
+    $r = Run-Install $mm
+    Check 'P1 a successful re-run over it does replace the command (sanity)' ((-not $r.Threw) -and (Get-Item -LiteralPath ($testKey + '\shell\open\command')).GetValue('') -ceq (Get-ProtocolCommand (Hd)))
+    Remove-TestKey
+    Check 'R3 SAFETY: the real HKLM:\SOFTWARE\Classes\mousecal is still as before' ((Test-Path -LiteralPath 'HKLM:\SOFTWARE\Classes\mousecal') -eq $hklmKeyBefore)
 } finally {
     Remove-Item -LiteralPath $sbRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

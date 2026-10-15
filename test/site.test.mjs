@@ -179,3 +179,13 @@ test('README documents the protocol, its limits and how uninstall removes it', (
     assert.ok(r.includes(needle), 'README lacks ' + needle);
   }
 });
+
+test('README: node test glob, VBScript deprecation + copy-command fallback, per-user handler log, lock and ACL notes', () => {
+  const r = read('README.md');
+  assert.ok(r.includes('node --test test/*.mjs'), 'test glob missing');
+  assert.ok(!r.includes('node --test test/analysis.test.mjs test/site.test.mjs'), 'old explicit test list still there');
+  assert.match(r, /VBScript[\s\S]{0,200}deprecated/);
+  assert.match(r, /copy-command method[\s\S]{0,200}neither the handler nor VBScript/);
+  assert.ok(r.includes('%LOCALAPPDATA%\\mousecal\\handler.log') && !r.includes('%ProgramData%\\mousecal'), 'handler log location');
+  assert.ok(r.includes('Global\\mousecal-setup') && r.includes('.staging\\<guid>'), 'mutex / staging notes');
+});

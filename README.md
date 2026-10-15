@@ -179,8 +179,8 @@ What is installed (all by the elevated install, in an administrators-only place)
   with "current -> new", and only on Yes start the **local** `setup.ps1 -Rotation <new absolute value> -NoPause`
   (or `-Uninstall -NoPause`) elevated through UAC, wait, and show a result dialog from the exit code. It uses
   the absolute rotation so a retry cannot add the measurement twice. It logs values only (no personal data) to
-  `%ProgramData%\mousecal\handler.log`; that small log is not touched by the elevated uninstall (a folder any
-  user can write to is never deleted by an administrator process), so delete it by hand if you want.
+  `%LOCALAPPDATA%\mousecal\handler.log` (per user, in the user's own profile, so the elevated uninstall does not
+  touch it); delete it by hand if you want.
 
 Security limits of the protocol:
 
@@ -194,6 +194,20 @@ Security limits of the protocol:
   setup downloads the pinned Raw Accel files as usual). The local copy is the version you installed; to update
   it, run the install command again.
 - A web page can only start the handler, never feed it anything but the two link shapes.
+- The handler relies on **VBScript** (`wscript.exe` + `handler.vbs`). Microsoft has deprecated VBScript and may
+  ship Windows builds without it; if the one-click buttons stop working, use the copy-command method on the
+  website, which needs neither the handler nor VBScript. When a 32-bit `wscript.exe` runs the handler, the 64-bit
+  PowerShell is started through `Sysnative`.
+
+Concurrency and permissions: a real run takes the named mutex `Global\mousecal-setup`; a second run exits with
+code 1 ("another mousecal setup is running"). Each run stages in its own `.staging\<guid>` folder and removes only
+that one. `<ProgramFiles>\RawAccel\RawAccel` and `...\mousecal` are locked to SYSTEM + Administrators full control
+and Users read & execute (SIDs, inheritance removed, applied recursively, owner Administrators) before any file is
+copied and again after `settings.json` is written, even if the folder pre-existed with user write access. So
+editing `settings.json`, or saving from the Raw Accel GUI, needs an administrator. If the driver profiles have
+different rotations, `-Measured` and the one-click button refuse (exit 3); `-Rotation <deg>` still sets them all.
+After the mouse devices are restarted, any mouse that was OK before and is not OK now undoes the install (exit 8),
+even when the driver reports Running.
 
 `-Uninstall` removes the registry key (only if its command still points at this handler), the three files and
 the folder (if nothing else is in it). It does this after the driver removal succeeded, so a failed uninstall
@@ -236,12 +250,13 @@ service key, and also waits for a key. That is why completion is detected by obs
 ## Tests
 
 ```
-node --test test/analysis.test.mjs test/site.test.mjs
+node --test test/*.mjs
 powershell -NoProfile -ExecutionPolicy Bypass -File test\setup.test.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File setup.ps1 -DryRun -NoPause -Measured 2.3
 ```
 
-`analysis.test.mjs` recovers synthetic +5 / -3 / 0 degree swipes (with noise, 60 / 144 Hz event rates) within
+Use the glob `node --test test/*.mjs` (a bare `node --test` or `test/` also picks up `setup.test.ps1`, which is not a
+node test). `analysis.test.mjs` recovers synthetic +5 / -3 / 0 degree swipes (with noise, 60 / 144 Hz event rates) within
 0.3 degrees. Set `MOUSECAL_SAMPLE_CSV` to a capture CSV to also check real data. `setup.test.ps1` is offline and
 never installs anything (the system-changing functions are not called). Its `mousecal://` tests redirect the
 registry key to a throw-away `HKCU:\Software\mousecal-test-<random>` key (removed at the end), stub the folder
@@ -290,7 +305,7 @@ MIT licensed, see `LICENSE`. By [Hydr0neFN](https://github.com/Hydr0neFN).
 （`mousecal://apply?m=<角度>`）和「一鍵解除安裝」（`mousecal://uninstall`）就不用再複製指令。安全限制：每次都會先跳出
 確認視窗（預設「否」）再跳 UAC；只接受這兩種動作；連結只能含 `[A-Za-z0-9:/?=.&-]` 且不超過 64 字元，量測值
 |m| <= 20，套用後的旋轉不得超過 ±45°；有遊戲在執行時拒絕；提升權限後只會執行資料夾裡那份本機的 `setup.ps1`。
-解除安裝時會一併移除這些檔案和登錄機碼（記錄檔 `%ProgramData%\mousecal\handler.log` 只含數值，可自行刪除）。
+解除安裝時會一併移除這些檔案和登錄機碼（記錄檔 `%LOCALAPPDATA%\mousecal\handler.log` 只含數值，放在各使用者自己的資料夾，可自行刪除）。
 
 部署與修改：見上方英文說明（Deploy、Forking）。fork 時請修改 `commands.js` 的 `SITE_BASE`，以及
 `tools/setup.src.ps1` 的 `$SiteBase`，再執行 `node tools/build-setup.mjs`。

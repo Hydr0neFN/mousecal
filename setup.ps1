@@ -23,6 +23,9 @@
   4 hash mismatch, 5 invalid signature, 6 game / anti-cheat running, 7 prerequisite
   missing, 8 driver install failed (rolled back).
   Dot-source with $env:MOUSECAL_NO_MAIN = '1' to load the functions without running.
+  Only one real run at a time (named mutex Global\mousecal-setup; a second run exits with code 1).
+  <ProgramFiles>\RawAccel\RawAccel and \mousecal are locked to SYSTEM + Administrators full control, Users
+  read & execute only (icacls, SIDs, recursive), before files are copied and after settings.json is written.
 
   One-click link: a real install also registers the mousecal:// URL protocol (HKLM\SOFTWARE\Classes\mousecal)
   and writes handler.vbs, handler.ps1 and a copy of this script to <ProgramFiles>\RawAccel\mousecal\
@@ -59,6 +62,8 @@ $ServiceKey   = 'HKLM:\SYSTEM\CurrentControlSet\Services\rawaccel'
 $DriverSysPath = Join-Path $env:SystemRoot 'System32\drivers\rawaccel.sys'
 $ProtocolKey  = 'HKLM:\SOFTWARE\Classes\mousecal'                   # the mousecal:// URL protocol (one-click apply / uninstall)
 $script:StageDir     = $null
+$SetupMutexName = 'Global\mousecal-setup'                              # one real (non -DryRun) run at a time
+$MouseSettleSeconds = 5                                               # how long a restarted mouse may take to come back (health check)
 
 # Games / anti-cheat processes: setup refuses to change anything while one is running.
 # The FACEIT, BattlEye and Perfect World Arena names are best-effort (taken from public
@@ -397,7 +402,8 @@ function Test-DriverActive([string]$DllDir = '', [string]$WorkDir = '') {
     }
     $wd = if ($WorkDir) { $WorkDir } else { $script:StageDir }   # never %TEMP%: the helper script runs elevated
     if ($DllDir -and $wd) {
-        try { [void](Get-ActiveRotation $DllDir $wd); return $true } catch { }
+        try { [void](Get-ActiveRotation $DllDir $wd); return $true }
+        catch { if ($_.Exception.Data['ExitCode'] -eq 3) { return $true } }     # profiles disagree: the driver IS running
     }
     if (-not $cimOk) { $script:DriverProbeFailed = $true }
     return $false
@@ -439,12 +445,55 @@ function Backup-Settings([string]$Path) {
     return $bak
 }
 
+# ------------------------------------------------ folder permissions (SID based)
+function Invoke-Icacls([string[]]$IcaclsArgs) {
+    $out = & icacls.exe @IcaclsArgs 2>&1
+    return @{ Code = $LASTEXITCODE; Out = (($out | Out-String).Trim()) }
+}
+
+# Locks a folder: SYSTEM + Administrators full control, Users read & execute only, inheritance removed
+# (SIDs, so it works on any Windows language). Unless -NoRecurse, everything below it is made to inherit
+# exactly that (explicit entries of any other principal are dropped) and is owned by Administrators, so
+# the files stay unwritable for normal users even when the folder pre-existed with user Full control
+# (a file's owner can always rewrite its permissions).
+function Protect-AppDir([string]$Dir, [switch]$NoRecurse) {
+    $aces = @('*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX')
+    if (-not $NoRecurse) {
+        $r = Invoke-Icacls @($Dir, '/setowner', '*S-1-5-32-544', '/T', '/C')
+        if ($r.Code -ne 0) { Fail 'Could not take ownership of {0}: {1}' '\u7121\u6cd5\u53d6\u5f97 {0} \u7684\u64c1\u6709\u6b0a\uff1a{1}' @($Dir, $r.Out) 1 }
+    }
+    $r = Invoke-Icacls (@($Dir, '/inheritance:r', '/grant:r') + $aces)
+    if ($r.Code -ne 0) { Fail 'Could not lock down the folder {0}: {1}' '\u7121\u6cd5\u9396\u5b9a\u8cc7\u6599\u593e {0}\uff1a{1}' @($Dir, $r.Out) 1 }
+    if (-not $NoRecurse -and (Get-ChildItem -LiteralPath $Dir -Force | Select-Object -First 1)) {
+        $r = Invoke-Icacls @((Join-Path $Dir '*'), '/reset', '/T', '/C')
+        if ($r.Code -ne 0) { Fail 'Could not lock down the files in {0}: {1}' '\u7121\u6cd5\u9396\u5b9a {0} \u88e1\u7684\u6a94\u6848\uff1a{1}' @($Dir, $r.Out) 1 }
+    }
+}
+
+# ------------------------------------------------------- one run at a time
+# Returns the held mutex, or $null when another mousecal setup holds it. Release with Exit-SetupLock.
+function Enter-SetupLock([string]$Name = $SetupMutexName) {
+    $m = $null
+    try {
+        $m = New-Object Threading.Mutex($false, $Name)
+        $got = $false
+        try { $got = $m.WaitOne(0) } catch [Threading.AbandonedMutexException] { $got = $true }   # a crashed run left it: we own it now
+        if ($got) { return $m }
+        $m.Dispose()
+    } catch [UnauthorizedAccessException] { if ($m) { $m.Dispose() } }
+    return $null
+}
+function Exit-SetupLock($Mutex) {
+    if ($Mutex) { try { $Mutex.ReleaseMutex() } catch { }; $Mutex.Dispose() }
+}
+
 # ---------------------------------------------------- admin-only staging folder
-# Real runs stage under Program Files (administrators only). Only -DryRun, which never
+# Real runs stage under Program Files (administrators only) in a per-run folder
+# .staging\<guid>; only that folder is removed afterwards. Only -DryRun, which never
 # runs anything it downloads as an installer, uses the temp folder.
 function Get-StagePath {
     if ($DryRun) { return (Join-Path ([IO.Path]::GetTempPath()) ('mousecal-dryrun-' + [guid]::NewGuid().ToString('N'))) }
-    return (Join-Path $InstallRoot '.staging')
+    return (Join-Path (Join-Path $InstallRoot '.staging') ([guid]::NewGuid().ToString('N')))
 }
 
 function New-StageDir {
@@ -453,18 +502,27 @@ function New-StageDir {
         New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
         if ($script:Tx) { $script:Tx.RootCreated = $true }
     }
-    if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force }
     New-Item -ItemType Directory -Path $p -Force | Out-Null
     if (-not $DryRun) {
-        # Administrators + SYSTEM only, no inheritance (SIDs, so it works on any Windows language)
-        $out = & icacls.exe $p '/inheritance:r' '/grant:r' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' 2>&1
-        if ($LASTEXITCODE -ne 0) { Fail 'Could not lock down the staging folder {0}: {1}' '\u7121\u6cd5\u9396\u5b9a\u66ab\u5b58\u8cc7\u6599\u593e {0}\uff1a{1}' @($p, ($out | Out-String).Trim()) 1 }
+        foreach ($d in (Split-Path -Parent $p), $p) {
+            $r = Invoke-Icacls @($d, '/inheritance:r', '/grant:r', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F')
+            if ($r.Code -ne 0) { Fail 'Could not lock down the staging folder {0}: {1}' '\u7121\u6cd5\u9396\u5b9a\u66ab\u5b58\u8cc7\u6599\u593e {0}\uff1a{1}' @($d, $r.Out) 1 }
+        }
     }
     return $p
 }
 
+# Removes this run's own staging folder (and the .staging parent when nothing else is in it).
 function Remove-StageDir {
-    if ($script:StageDir -and (Test-Path -LiteralPath $script:StageDir)) { Remove-Item -LiteralPath $script:StageDir -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($script:StageDir -and (Test-Path -LiteralPath $script:StageDir)) {
+        Remove-Item -LiteralPath $script:StageDir -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not $DryRun) {
+            $parent = Split-Path -Parent $script:StageDir
+            if ((Split-Path -Leaf $parent) -eq '.staging' -and (Test-Path -LiteralPath $parent) -and -not (Get-ChildItem -LiteralPath $parent -Force)) {
+                Remove-Item -LiteralPath $parent -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
 }
 
 function Save-Download([string]$Url, [string]$Dest) {
@@ -513,8 +571,13 @@ try {
     Add-Type -Path (Join-Path $Dir 'Newtonsoft.Json.dll')
     [void][Reflection.Assembly]::LoadFrom((Join-Path $Dir 'wrapper.dll'))
     $c = [DriverConfig]::GetActive()
-    $r = [double]$c.profiles[0].rotation
-    Write-Output ('ROT ' + $r.ToString('R', [Globalization.CultureInfo]::InvariantCulture))
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $all = @($c.profiles | ForEach-Object { ([double]$_.rotation).ToString('R', $inv) })
+    $first = [double]$c.profiles[0].rotation
+    $mixed = $false
+    foreach ($p in $c.profiles) { if ([math]::Abs([double]$p.rotation - $first) -gt 0.0001) { $mixed = $true } }
+    if ($mixed) { Write-Output ('MIXED ' + ($all -join ' ')) }
+    else { Write-Output ('ROT ' + $first.ToString('R', $inv)) }
 } catch {
     Write-Output ('ERROR: ' + $_.Exception.Message); exit 3
 }
@@ -531,6 +594,9 @@ function Test-SettingsJson([string]$DllDir, [string]$JsonPath, [string]$WorkDir)
 # Rotation (degrees) the running driver applies right now, read from the driver itself.
 function Get-ActiveRotation([string]$DllDir, [string]$WorkDir) {
     $r = Invoke-Ps51Script $ActiveScript $WorkDir 'read-active.ps1' @('-Dir', $DllDir)
+    if ($r.Code -eq 0 -and $r.Out -match '^MIXED\s+(.+)$') {
+        Fail 'Your Raw Accel profiles have different rotations ({0}), so the measured correction cannot be added to one value. Nothing was changed. Make them equal in Raw Accel, or use -Rotation <degrees> to set them all.' '\u4f60\u7684 Raw Accel \u8a2d\u5b9a\u6a94\u65cb\u8f49\u89d2\u5ea6\u4e0d\u4e00\u81f4\uff08{0}\uff09\uff0c\u7121\u6cd5\u628a\u91cf\u5230\u7684\u6821\u6b63\u52a0\u5230\u55ae\u4e00\u6578\u503c\u4e0a\u3002\u6c92\u6709\u8b8a\u66f4\u4efb\u4f55\u6771\u897f\u3002\u8acb\u5728 Raw Accel \u628a\u5b83\u5011\u6539\u6210\u4e00\u6a23\uff0c\u6216\u7528 -Rotation <\u5ea6\u6578> \u4e00\u6b21\u5168\u90e8\u8a2d\u5b9a\u3002' @(($Matches[1] -replace '\s+', ', ')) 3
+    }
     if ($r.Code -eq 0 -and $r.Out -match 'ROT\s+(\S+)') {
         $v = 0.0
         if ([double]::TryParse($Matches[1], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$v)) { return $v }
@@ -598,7 +664,10 @@ function Install-RawAccelDriver([string]$Dir) {
     $exe = Join-Path $Dir 'installer.exe'
     Assert-PinnedFile $exe 'installer.exe'
     Assert-PinnedFile (Join-Path $Dir 'driver\rawaccel.sys') 'driver/rawaccel.sys'
-    if ($script:Tx) { $script:Tx.DriverInstalled = $true }      # set first: a half-done install is rolled back too
+    if ($script:Tx) {
+        $script:Tx.DriverInstalled = $true      # set first: a half-done install is rolled back too
+        Write-Marker $script:Tx                 # ... and recorded on disk first: a crash / closed window still leaves uninstall knowing about the driver
+    }
     Say 'Running installer.exe (hidden). This can take up to a minute.' '\u57f7\u884c installer.exe\uff08\u96b1\u85cf\uff09\uff0c\u6700\u591a\u9700\u8981\u4e00\u5206\u9418\u3002'
     $r = Invoke-DriverTool $exe 'install'
     if (-not $r.Ok) {
@@ -609,10 +678,18 @@ function Install-RawAccelDriver([string]$Dir) {
 }
 
 # ------------------------------------------------------------ mouse devices
-function Get-MouseDevicesInError {
-    $r = @()
-    try { $r = @(Get-PnpDevice -Class Mouse -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Error' } | ForEach-Object { $_.InstanceId }) } catch { }
+# InstanceId -> Status of every present Mouse-class device.
+function Get-MouseDeviceStatus {
+    $r = @{}
+    try { foreach ($d in @(Get-PnpDevice -Class Mouse -PresentOnly -ErrorAction SilentlyContinue)) { $r[[string]$d.InstanceId] = [string]$d.Status } } catch { }
     return $r
+}
+
+# Devices that were OK in $Before and are present but not OK now (devices that were already
+# broken, or are gone, are ignored).
+function Get-MouseRegressions($Before) {
+    $now = Get-MouseDeviceStatus
+    return @($Before.Keys | Where-Object { $Before[$_] -eq 'OK' -and $now.ContainsKey($_) -and $now[$_] -ne 'OK' } | Sort-Object)
 }
 
 # Restarts every present mouse device so the (un)installed filter driver attaches/detaches
@@ -688,7 +765,9 @@ If Not re.Test(url) Then WScript.Quit 2
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set sh = CreateObject("WScript.Shell")
 dir = fso.GetParentFolderName(WScript.ScriptFullName)
-ps = fso.GetSpecialFolder(1) & "\WindowsPowerShell\v1.0\powershell.exe"
+' a 32-bit wscript.exe would otherwise start the 32-bit PowerShell: use the 64-bit one through Sysnative when it exists
+ps = fso.GetSpecialFolder(0) & "\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+If Not fso.FileExists(ps) Then ps = fso.GetSpecialFolder(0) & "\System32\WindowsPowerShell\v1.0\powershell.exe"
 cmd = """" & ps & """ -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & dir & "\handler.ps1"" -Url """ & url & """"
 sh.Run cmd, 0, False
 '@
@@ -706,7 +785,7 @@ $ErrorActionPreference = 'Stop'
 $McRunMain = ($env:MOUSECAL_NO_MAIN -ne '1')
 $McDir   = $PSScriptRoot
 $McSetup = Join-Path $McDir 'setup.ps1'
-$McLog   = Join-Path $env:ProgramData 'mousecal\handler.log'
+$McLog   = Join-Path $env:LOCALAPPDATA 'mousecal\handler.log'      # per user: the handler runs as the normal user
 if (-not (Get-Command Get-RunningAntiCheatGames -CommandType Function -ErrorAction SilentlyContinue)) {
     $env:MOUSECAL_NO_MAIN = '1'
     try { . $McSetup } finally { if ($McRunMain) { Remove-Item -LiteralPath Env:\MOUSECAL_NO_MAIN -ErrorAction SilentlyContinue } }
@@ -800,15 +879,24 @@ function Get-CurrentRotation {
     } finally { Remove-Item -LiteralPath $wd -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+# Windows PowerShell 5.1 to start: under a 32-bit host System32 is redirected to the 32-bit one, so use Sysnative then.
+function Get-HandlerPowerShell([bool]$Is64 = [Environment]::Is64BitProcess, [string]$Root = $env:SystemRoot) {
+    if (-not $Is64) {
+        $sys = Join-Path $Root 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
+        if (Test-Path -LiteralPath $sys -PathType Leaf) { return $sys }
+    }
+    return (Join-Path $Root 'System32\WindowsPowerShell\v1.0\powershell.exe')
+}
+
 # Starts the LOCAL setup.ps1 elevated (UAC), waits, returns its exit code (1223 = UAC declined).
 function Invoke-Elevated([string]$ScriptPath, [string[]]$ScriptArgs) {
     $want = [IO.Path]::GetFullPath((Join-Path $McDir 'setup.ps1'))
     if (-not [string]::Equals([IO.Path]::GetFullPath($ScriptPath), $want, [StringComparison]::OrdinalIgnoreCase)) { throw 'refusing to elevate a script outside the mousecal folder' }
     foreach ($a in $ScriptArgs) { if ($a -cnotmatch '^-?[A-Za-z0-9.]+\z') { throw 'refusing to pass an unexpected argument' } }
-    $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $ps = Get-HandlerPowerShell
     $line = '-NoProfile -ExecutionPolicy Bypass -File "' + $want + '" ' + ($ScriptArgs -join ' ')
     try {
-        $p = Start-Process -FilePath $ps -ArgumentList $line -Verb RunAs -Wait -PassThru
+        $p = Start-Process -FilePath $ps -ArgumentList $line -Verb RunAs -WindowStyle Hidden -Wait -PassThru
         return [int]$p.ExitCode
     } catch {
         for ($e = $_.Exception; $e; $e = $e.InnerException) {
@@ -886,10 +974,7 @@ function Get-SelfScriptText {
 
 # Folder permissions: administrators + SYSTEM full control, Users read & execute only (the
 # handler runs as the normal user and must be able to read these files, never change them).
-function Protect-HandlerDir([string]$Dir) {
-    $out = & icacls.exe $Dir '/inheritance:r' '/grant:r' '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' 2>&1
-    if ($LASTEXITCODE -ne 0) { Fail 'Could not lock down the folder {0}: {1}' '\u7121\u6cd5\u9396\u5b9a\u8cc7\u6599\u593e {0}\uff1a{1}' @($Dir, ($out | Out-String).Trim()) 1 }
-}
+function Protect-HandlerDir([string]$Dir) { Protect-AppDir $Dir }
 
 # Writes a file only when its content differs (the running script may be the very file).
 function Write-IfChanged([string]$Path, [byte[]]$Bytes) {
@@ -926,6 +1011,38 @@ function Register-UrlProtocol([string]$Dir = '', [string]$Key = '') {
     New-ItemProperty -LiteralPath $Key -Name 'URL Protocol' -Value '' -PropertyType String -Force | Out-Null
     New-Item -Path $cmdKey -Force | Out-Null
     Set-Item -LiteralPath $cmdKey -Value (Get-ProtocolCommand $Dir)
+}
+
+# What the protocol key holds right now ($null = no key), so a failed re-run can put it back exactly.
+function Get-UrlProtocolSnapshot([string]$Key = '') {
+    if (-not $Key) { $Key = $ProtocolKey }
+    if (-not (Test-Path -LiteralPath $Key)) { return $null }
+    $k = Get-Item -LiteralPath $Key
+    $snap = @{ HasDefault = ($k.GetValueNames() -contains ''); Default = $null; HasUrlProtocol = ($k.GetValueNames() -contains 'URL Protocol'); UrlProtocol = $null; HasCommand = $false; Command = $null; HasCommandDefault = $false }
+    if ($snap.HasDefault) { $snap.Default = $k.GetValue('', $null, 'DoNotExpandEnvironmentNames') }
+    if ($snap.HasUrlProtocol) { $snap.UrlProtocol = $k.GetValue('URL Protocol', $null, 'DoNotExpandEnvironmentNames') }
+    $ck = Join-Path $Key 'shell\open\command'
+    if (Test-Path -LiteralPath $ck) {
+        $c = Get-Item -LiteralPath $ck
+        $snap.HasCommand = $true
+        $snap.HasCommandDefault = ($c.GetValueNames() -contains '')
+        if ($snap.HasCommandDefault) { $snap.Command = $c.GetValue('', $null, 'DoNotExpandEnvironmentNames') }
+    }
+    return $snap
+}
+
+function Restore-UrlProtocolSnapshot($Snap, [string]$Key = '') {
+    if (-not $Key) { $Key = $ProtocolKey }
+    if ($null -eq $Snap) { if (Test-Path -LiteralPath $Key) { Remove-Item -LiteralPath $Key -Recurse -Force }; return }
+    if (-not (Test-Path -LiteralPath $Key)) { New-Item -Path $Key -Force | Out-Null }
+    if ($Snap.HasDefault) { Set-Item -LiteralPath $Key -Value $Snap.Default } else { Remove-ItemProperty -LiteralPath $Key -Name '(default)' -ErrorAction SilentlyContinue }
+    if ($Snap.HasUrlProtocol) { New-ItemProperty -LiteralPath $Key -Name 'URL Protocol' -Value $Snap.UrlProtocol -PropertyType String -Force | Out-Null }
+    else { Remove-ItemProperty -LiteralPath $Key -Name 'URL Protocol' -ErrorAction SilentlyContinue }
+    $ck = Join-Path $Key 'shell\open\command'
+    if ($Snap.HasCommand) {
+        if (-not (Test-Path -LiteralPath $ck)) { New-Item -Path $ck -Force | Out-Null }
+        if ($Snap.HasCommandDefault) { Set-Item -LiteralPath $ck -Value $Snap.Command } else { Remove-ItemProperty -LiteralPath $ck -Name '(default)' -ErrorAction SilentlyContinue }
+    } elseif (Test-Path -LiteralPath (Join-Path $Key 'shell')) { Remove-Item -LiteralPath (Join-Path $Key 'shell') -Recurse -Force }
 }
 
 # Removes the registry key (only if it points at our handler) and our three files; the folder
@@ -1013,7 +1130,7 @@ function New-Tx {
         Mutated = $false; RootCreated = $false; AppDirCreated = $false; CreatedFiles = @()
         SettingsExisted = $false; SettingsBytes = $null; SettingsWritten = $false; BackupPath = $null
         DriverInstalled = $false; PriorDriver = $false; PriorAppDir = $false; OrigMarkerBytes = $null; Overwritten = @(); OldTaskXml = $null; HadOldTask = $false; TaskRegistered = $false; OldVbsBytes = $null
-        ProtocolRegistered = $false; PriorProtocol = $false
+        ProtocolRegistered = $false; PriorProtocol = $false; ProtocolSnapshot = $null
     }
 }
 
@@ -1029,8 +1146,11 @@ function Invoke-Rollback {
             if ($tx.OldTaskXml) { try { Register-ScheduledTask -TaskName $TaskName -Xml $tx.OldTaskXml -Force | Out-Null } catch { $problems.Add('previous task: ' + $_.Exception.Message) } }
             if ($tx.OldVbsBytes) { try { [IO.File]::WriteAllBytes($VbsPath, $tx.OldVbsBytes) } catch { $problems.Add('old VBS: ' + $_.Exception.Message) } }
         }
-        if ($tx.ProtocolRegistered -and -not $tx.PriorProtocol) {
-            try { Unregister-UrlProtocol } catch { $problems.Add('mousecal:// link: ' + $_.Exception.Message) }
+        if ($tx.ProtocolRegistered) {
+            try {
+                if (-not $tx.PriorProtocol) { Unregister-UrlProtocol }
+                else { Restore-UrlProtocolSnapshot $tx.ProtocolSnapshot }      # the key's previous values, exactly (or no key if there was none)
+            } catch { $problems.Add('mousecal:// link: ' + $_.Exception.Message) }
         }
         if ($tx.DriverInstalled -and $script:StageDir) {
             $un =Join-Path $script:StageDir 'uninstaller.exe'
@@ -1303,7 +1423,7 @@ function Invoke-Install($Arg) {
         if ($driverActive) {
             try { $active = Get-ActiveRotation $script:StageDir $script:StageDir }
             catch {
-                if ($DryRun) { Warn 'Could not read the active rotation in this dry run: {0}' '\u8a66\u8dd1\u6642\u7121\u6cd5\u8b80\u53d6\u76ee\u524d\u5957\u7528\u7684\u65cb\u8f49\u89d2\u5ea6\uff1a{0}' @($_.Exception.Message); $active = 0.0 }
+                if ($DryRun -and $_.Exception.Data['ExitCode'] -ne 3) { Warn 'Could not read the active rotation in this dry run: {0}' '\u8a66\u8dd1\u6642\u7121\u6cd5\u8b80\u53d6\u76ee\u524d\u5957\u7528\u7684\u65cb\u8f49\u89d2\u5ea6\uff1a{0}' @($_.Exception.Message); $active = 0.0 }
                 else { throw }
             }
         }
@@ -1344,15 +1464,16 @@ function Invoke-Install($Arg) {
     # ---- DRY RUN stops here after listing the actions
     if ($DryRun) {
         Step 'Actions a real run would perform' '\u6b63\u5f0f\u57f7\u884c\u6642\u6703\u505a\u7684\u4e8b'
+        Dry 'Lock {0} (non-recursive) and {1} + {2} (recursive) to SYSTEM + Administrators full control, Users read & execute only, inheritance removed (icacls, SIDs); again after settings.json is written' '\u628a {0}\uff08\u4e0d\u542b\u5b50\u9805\u76ee\uff09\u4ee5\u53ca {1}\u3001{2}\uff08\u542b\u6240\u6709\u5b50\u9805\u76ee\uff09\u9396\u6210\u53ea\u6709 SYSTEM \u8207\u7cfb\u7d71\u7ba1\u7406\u54e1\u53ef\u5b8c\u5168\u63a7\u5236\u3001\u4e00\u822c\u4f7f\u7528\u8005\u53ea\u80fd\u8b80\u53d6\u8207\u57f7\u884c\u3001\u79fb\u9664\u7e7c\u627f\uff08icacls\uff0c\u4f7f\u7528 SID\uff09\uff1b\u5beb\u5165 settings.json \u5f8c\u518d\u9396\u4e00\u6b21' @($InstallRoot, $AppDir, (Get-HandlerDir))
         Dry 'Copy the {0} verified files to {1} (only new/changed ones), re-check their hashes' '\u628a {0} \u500b\u5df2\u9a57\u8b49\u7684\u6a94\u6848\u8907\u88fd\u5230 {1}\uff08\u53ea\u8907\u88fd\u65b0\u7684\uff0f\u6709\u8b8a\u7684\uff09\uff0c\u4e26\u518d\u6b21\u6838\u5c0d\u96dc\u6e4a\u503c' @($table.Count, $AppDir)
-        Dry 'Write the marker {0} (so uninstall only removes what we installed)' '\u5beb\u5165\u6a19\u8a18 {0}\uff08\u8b93\u89e3\u9664\u5b89\u88dd\u53ea\u79fb\u9664\u6211\u5011\u88dd\u7684\u6771\u897f\uff09' @($MarkerPath)
+        Dry 'Write the marker {0} (so uninstall only removes what we installed; written again, with the driver flag, BEFORE installer.exe runs)' '\u5beb\u5165\u6a19\u8a18 {0}\uff08\u8b93\u89e3\u9664\u5b89\u88dd\u53ea\u79fb\u9664\u6211\u5011\u88dd\u7684\u6771\u897f\uff1b\u5728\u57f7\u884c installer.exe \u4e4b\u524d\u6703\u518d\u5beb\u4e00\u6b21\u4e26\u8a18\u4e0b\u9a45\u52d5\u7a0b\u5f0f\u65d7\u6a19\uff09' @($MarkerPath)
         if ($existing) { Dry 'Back up {0} to settings.json.bak-<timestamp>' '\u5c07 {0} \u5099\u4efd\u70ba settings.json.bak-<\u6642\u9593\u6233\u8a18>' @($SettingsPath) }
         Dry 'Write {0} (UTF-8, no BOM), rotation = {1}; validate it with the installed wrapper.dll' '\u5beb\u5165 {0}\uff08UTF-8\uff0c\u7121 BOM\uff09\uff0c\u65cb\u8f49 = {1}\uff1b\u7528\u5df2\u5b89\u88dd\u7684 wrapper.dll \u9a57\u8b49' @($SettingsPath, $rotText)
         if ($filterPresent) { Dry 'Skip installer.exe (rawaccel driver already registered)' '\u7565\u904e installer.exe\uff08rawaccel \u9a45\u52d5\u7a0b\u5f0f\u5df2\u8a3b\u518a\uff09' }
         else { Dry 'Run the verified installer.exe hidden (copies rawaccel.sys, creates the service, adds the filter last); wait up to 60 s for filter + file + service, then stop it' '\u96b1\u85cf\u57f7\u884c\u5df2\u9a57\u8b49\u7684 installer.exe\uff08\u8907\u88fd rawaccel.sys\u3001\u5efa\u7acb\u670d\u52d9\u3001\u6700\u5f8c\u52a0\u5165\u7be9\u9078\u5668\uff09\uff1b\u6700\u591a\u7b49 60 \u79d2\u8b93\u7be9\u9078\u5668\u3001\u6a94\u6848\u3001\u670d\u52d9\u90fd\u51fa\u73fe\uff0c\u7136\u5f8c\u7d50\u675f\u5b83' }
         if (-not $driverActive) {
             Dry 'Re-check for running games, then restart the mouse devices (pnputil /restart-device) so the driver attaches without a reboot' '\u518d\u78ba\u8a8d\u6c92\u6709\u904a\u6232\u5728\u57f7\u884c\uff0c\u7136\u5f8c\u91cd\u65b0\u555f\u52d5\u6ed1\u9f20\u88dd\u7f6e\uff08pnputil /restart-device\uff09\uff0c\u8b93\u9a45\u52d5\u7a0b\u5f0f\u4e0d\u7528\u91cd\u958b\u6a5f\u5c31\u80fd\u639b\u4e0a\u53bb'
-            Dry 'Health check: if a mouse device is in Error and the driver is not running -> undo everything (uninstall driver, restore files) and stop with exit code 8' '\u5065\u5eb7\u6aa2\u67e5\uff1a\u5982\u679c\u6709\u6ed1\u9f20\u88dd\u7f6e\u7570\u5e38\u800c\u9a45\u52d5\u7a0b\u5f0f\u6c92\u5728\u904b\u4f5c -> \u5168\u90e8\u9084\u539f\uff08\u79fb\u9664\u9a45\u52d5\u7a0b\u5f0f\u3001\u9084\u539f\u6a94\u6848\uff09\u4e26\u4ee5\u7d50\u675f\u4ee3\u78bc 8 \u505c\u6b62'
+            Dry 'Health check: if a mouse device that was OK before the restart is not OK afterwards (even when the driver runs) -> undo everything (uninstall driver, restore files) and stop with exit code 8' '\u5065\u5eb7\u6aa2\u67e5\uff1a\u5982\u679c\u91cd\u65b0\u555f\u52d5\u524d\u6b63\u5e38\u7684\u6ed1\u9f20\u88dd\u7f6e\u5728\u91cd\u65b0\u555f\u52d5\u5f8c\u4e0d\u6b63\u5e38\uff08\u5373\u4f7f\u9a45\u52d5\u7a0b\u5f0f\u5728\u904b\u4f5c\uff09-> \u5168\u90e8\u9084\u539f\uff08\u79fb\u9664\u9a45\u52d5\u7a0b\u5f0f\u3001\u9084\u539f\u6a94\u6848\uff09\u4e26\u4ee5\u7d50\u675f\u4ee3\u78bc 8 \u505c\u6b62'
         }
         if ($oldTask) { Dry 'Replace the existing scheduled task "{0}" (an older version of this tool created it){1}' '\u53d6\u4ee3\u65e2\u6709\u7684\u5de5\u4f5c\u6392\u7a0b\u300c{0}\u300d\uff08\u9019\u500b\u5de5\u5177\u820a\u7248\u5efa\u7acb\u7684\uff09{1}' @($TaskName, $(if (Test-Path -LiteralPath $VbsPath) { ' and delete ' + $VbsPath } else { '' })) }
         Dry 'Register scheduled task "{0}": runs as SYSTEM (highest), at startup (delay 15 s) and at every logon (delay 10 s), 2 min limit -> "{1}" "{2}"' '\u8a3b\u518a\u5de5\u4f5c\u6392\u7a0b\u300c{0}\u300d\uff1a\u4ee5 SYSTEM\uff08\u6700\u9ad8\u6b0a\u9650\uff09\u57f7\u884c\uff0c\u958b\u6a5f\u5f8c\u5ef6\u9072 15 \u79d2\u3001\u6bcf\u6b21\u767b\u5165\u5f8c\u5ef6\u9072 10 \u79d2\uff0c\u9650\u6642 2 \u5206\u9418 -> "{1}" "{2}"' @($TaskName, (Join-Path $AppDir 'writer.exe'), $SettingsPath)
@@ -1364,12 +1485,15 @@ function Invoke-Install($Arg) {
     }
 
     # =============================== real run: transactional from here on
-    $baselineBad = @(Get-MouseDevicesInError)
     try {
         # ---- 1. files
         Step 'Installing files to {0}' '\u5b89\u88dd\u6a94\u6848\u5230 {0}' @($AppDir)
         $tx.Mutated = $true
         if (-not (Test-Path -LiteralPath $AppDir)) { New-Item -ItemType Directory -Path $AppDir -Force | Out-Null; $tx.AppDirCreated = $true }
+        # Administrators / SYSTEM only may write here, BEFORE anything is copied or hash-checked (writer.exe runs as SYSTEM
+        # at every startup): also when the folder already existed with user write access.
+        Protect-AppDir $InstallRoot -NoRecurse
+        Protect-AppDir $AppDir
         foreach ($rel in $table.Keys) {
             $src = Join-Path $script:StageDir ($rel.Replace('/', '\'))
             $dest = Join-Path $AppDir ($rel.Replace('/', '\'))
@@ -1408,6 +1532,7 @@ function Invoke-Install($Arg) {
         }
         $tx.SettingsWritten = $true
         Write-Utf8NoBom $SettingsPath $newJson
+        Protect-AppDir $AppDir
         Test-SettingsJson $AppDir $SettingsPath $script:StageDir
         Ok 'Wrote {0} (rotation {1}); validated with the installed wrapper.dll.' '\u5df2\u5beb\u5165 {0}\uff08\u65cb\u8f49 {1}\uff09\uff1b\u5df2\u7528\u5b89\u88dd\u597d\u7684 wrapper.dll \u9a57\u8b49\u3002' @($SettingsPath, $rotText)
 
@@ -1426,14 +1551,17 @@ function Invoke-Install($Arg) {
             if ($gamesNow.Count -gt 0) {
                 Warn 'A game is running ({0}); the mouse devices are NOT restarted now. Reboot after closing it.' '\u6709\u904a\u6232\u5728\u57f7\u884c\uff08{0}\uff09\uff0c\u73fe\u5728\u4e0d\u91cd\u65b0\u555f\u52d5\u6ed1\u9f20\u88dd\u7f6e\u3002\u95dc\u9589\u904a\u6232\u5f8c\u8acb\u91cd\u65b0\u958b\u6a5f\u3002' @(($gamesNow -join ', '))
             } else {
+                $miceBefore = Get-MouseDeviceStatus
                 Say 'Restarting mouse devices so the driver attaches (the pointer may freeze for a second)...' '\u91cd\u65b0\u555f\u52d5\u6ed1\u9f20\u88dd\u7f6e\u8b93\u9a45\u52d5\u7a0b\u5f0f\u639b\u4e0a\u53bb\uff08\u6e38\u6a19\u53ef\u80fd\u505c\u9813\u4e00\u79d2\uff09\u2026\u2026'
                 [void](Restart-MouseDevices)
                 $driverActive = Test-DriverActive $AppDir $script:StageDir
-                $bad = @(Get-MouseDevicesInError | Where-Object { $baselineBad -notcontains $_ })
-                if ($bad.Count -gt 0 -and -not $driverActive) {
-                    Fail 'A mouse device went into an error state after installing the driver and the driver is not running ({0}). Everything is being undone.' '\u5b89\u88dd\u9a45\u52d5\u7a0b\u5f0f\u5f8c\u6709\u6ed1\u9f20\u88dd\u7f6e\u9032\u5165\u7570\u5e38\u72c0\u614b\uff0c\u800c\u4e14\u9a45\u52d5\u7a0b\u5f0f\u6c92\u6709\u5728\u904b\u4f5c\uff08{0}\uff09\u3002\u6b63\u5728\u5168\u90e8\u9084\u539f\u3002' @(($bad -join ', ')) 8
+                # a mouse that worked before and does not now is a failure, even if rawaccel reports Running
+                # (it gets a few seconds to come back; devices that were already broken are ignored)
+                $bad = @(Get-MouseRegressions $miceBefore)
+                for ($i = 0; $bad.Count -gt 0 -and $i -lt $MouseSettleSeconds; $i++) { Start-Sleep -Seconds 1; $bad = @(Get-MouseRegressions $miceBefore) }
+                if ($bad.Count -gt 0) {
+                    Fail 'A mouse device that worked before is not working after installing the driver ({0}). Everything is being undone.' '\u5b89\u88dd\u9a45\u52d5\u7a0b\u5f0f\u5f8c\uff0c\u539f\u672c\u6b63\u5e38\u7684\u6ed1\u9f20\u88dd\u7f6e\u4e0d\u80fd\u7528\u4e86\uff08{0}\uff09\u3002\u6b63\u5728\u5168\u90e8\u9084\u539f\u3002' @(($bad -join ', ')) 8
                 }
-                if ($bad.Count -gt 0) { Warn 'A mouse device reports an error state: {0}. If the mouse misbehaves, uninstall from the website.' '\u6709\u6ed1\u9f20\u88dd\u7f6e\u56de\u5831\u7570\u5e38\u72c0\u614b\uff1a{0}\u3002\u5982\u679c\u6ed1\u9f20\u4e0d\u6b63\u5e38\uff0c\u8acb\u5728\u7db2\u7ad9\u4e0a\u89e3\u9664\u5b89\u88dd\u3002' @(($bad -join ', ')) }
             }
         }
 
@@ -1454,6 +1582,7 @@ function Invoke-Install($Arg) {
         # buttons (the copy-command flow keeps working), so it is a warning; a later failure rolls it back.
         Step 'One-click link (mousecal://)' '\u4e00\u9375\u9023\u7d50\uff08mousecal://\uff09'
         $tx.PriorProtocol = Test-UrlProtocolPresent
+        $tx.ProtocolSnapshot = Get-UrlProtocolSnapshot
         $tx.ProtocolRegistered = $true
         $protocolOk = $false
         try {
@@ -1462,7 +1591,7 @@ function Invoke-Install($Arg) {
             Ok 'Registered the mousecal:// URL protocol; handler files are in {0} (administrators can write, everyone can read).' '\u5df2\u8a3b\u518a mousecal:// \u7db2\u5740\u901a\u8a0a\u5354\u5b9a\uff1b\u8655\u7406\u7a0b\u5f0f\u6a94\u6848\u5728 {0}\uff08\u53ea\u6709\u7cfb\u7d71\u7ba1\u7406\u54e1\u80fd\u4fee\u6539\uff0c\u6240\u6709\u4eba\u53ef\u8b80\u53d6\uff09\u3002' @((Get-HandlerDir))
         } catch {
             Warn 'Could not set up the one-click link ({0}). Everything else is installed; the copy-command method on the website keeps working.' '\u7121\u6cd5\u8a2d\u5b9a\u4e00\u9375\u9023\u7d50\uff08{0}\uff09\u3002\u5176\u4ed6\u90fd\u5df2\u5b89\u88dd\u5b8c\u6210\uff1b\u7db2\u7ad9\u4e0a\u300c\u8907\u88fd\u6307\u4ee4\u300d\u7684\u65b9\u6cd5\u4ecd\u7136\u53ef\u7528\u3002' @($_.Exception.Message)
-            try { if (-not $tx.PriorProtocol) { Unregister-UrlProtocol } } catch { }
+            try { if (-not $tx.PriorProtocol) { Unregister-UrlProtocol } else { Restore-UrlProtocolSnapshot $tx.ProtocolSnapshot } } catch { }
         }
 
         # ---- 6. apply now (never while a listed game runs)
@@ -1503,6 +1632,7 @@ function Invoke-MainCore {
     $ErrorActionPreference = 'Stop'
     $origModulePath = Repair-ModulePath
     $script:Tx = $null
+    $script:SetupLock = $null
     try {
         Write-Host ''
         Say ('Mouse rotation setup (Raw Accel v{0})' -f $RawAccelVersion) ('\u6ed1\u9f20\u65cb\u8f49\u6821\u6b63\u8a2d\u5b9a (Raw Accel v{0})' -f $RawAccelVersion) 'White' ''
@@ -1535,6 +1665,16 @@ function Invoke-MainCore {
         }
         [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
+        # ---- 5. one real run at a time (-DryRun changes nothing and does not take the lock)
+        if (-not $DryRun) {
+            $script:SetupLock = Enter-SetupLock
+            if (-not $script:SetupLock) {
+                Write-Host ''
+                Say 'Another mousecal setup is running right now. Wait for it to finish, then run this again. Nothing was changed.' '\u53e6\u4e00\u500b mousecal \u8a2d\u5b9a\u6b63\u5728\u57f7\u884c\u3002\u8acb\u7b49\u5b83\u7d50\u675f\u5f8c\u518d\u57f7\u884c\u4e00\u6b21\u3002\u76ee\u524d\u6c92\u6709\u4efb\u4f55\u8b8a\u66f4\u3002' 'Red' ''
+                return 1
+            }
+        }
+
         if ($arg.Kind -eq 'Uninstall') { Invoke-Uninstall; return 0 }
         $rc = @(Invoke-Install $arg)
         return [int]$rc[$rc.Count - 1]
@@ -1554,6 +1694,7 @@ function Invoke-MainCore {
         if (-not $DryRun -and $script:Tx -and $script:Tx.RootCreated -and (Test-Path -LiteralPath $InstallRoot) -and -not (Get-ChildItem -LiteralPath $InstallRoot -Force)) {
             Remove-Item -LiteralPath $InstallRoot -Force -ErrorAction SilentlyContinue
         }
+        if ($script:SetupLock) { Exit-SetupLock $script:SetupLock; $script:SetupLock = $null }
         if ($origModulePath) { $env:PSModulePath = $origModulePath }
     }
 }
