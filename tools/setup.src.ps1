@@ -573,10 +573,17 @@ function Clear-StaleStaging {
 function Clear-StagingForUninstall {
     $stg = Join-Path $InstallRoot '.staging'
     if ($DryRun -or -not (Test-Path -LiteralPath $stg)) { return }
-    if (Test-ReparsePoint $stg) { Fail '{0} is a link (junction/symlink); refusing to use it as the staging folder.' '{0} 是連結（junction／symlink）；拒絕把它當作暫存資料夾。' @($stg) 1 }
-    try { Protect-AppDir $InstallRoot -NoRecurse; Set-ExactDacl $stg } catch { Warn 'Could not lock down the staging folder {0}: {1}' '無法鎖定暫存資料夾 {0}：{1}' @($stg, $_.Exception.Message); return }
-    Clear-StaleStaging
-    if (-not [IO.Directory]::GetFileSystemEntries($stg).Count) { Remove-Item -LiteralPath $stg -Force -ErrorAction SilentlyContinue }
+    # uninstall has already removed the driver here: problems are warnings, never a failed exit
+    try {
+        Protect-AppDir $InstallRoot -NoRecurse      # lock the root first, THEN look at .staging (same order as New-StageDir)
+        if (Test-ReparsePoint $stg) {
+            Warn '{0} is a link (junction/symlink); it was left alone.' '{0} 是連結（junction／symlink），已略過。' @($stg)
+            return
+        }
+        Set-ExactDacl $stg
+        Clear-StaleStaging
+        if (-not [IO.Directory]::GetFileSystemEntries($stg).Count) { Remove-Item -LiteralPath $stg -Force -ErrorAction SilentlyContinue }
+    } catch { Warn 'Could not clean up the staging folder {0}: {1}' '無法清理暫存資料夾 {0}：{1}' @($stg, $_.Exception.Message) }
 }
 
 function Save-Download([string]$Url, [string]$Dest) {
@@ -768,7 +775,10 @@ function Wait-MouseRecovery($Before) {
         foreach ($k in $d.Error) { if (-not $errSince.ContainsKey($k)) { $errSince[$k] = $t } }
         $settled = @($d.Error | Where-Object { ($t - $errSince[$_]) -ge $MouseSettleSeconds })
         if ($settled.Count -gt 0) { break }
-        if ($t -ge $MouseMissingSeconds) { break }
+        # past the missing window: stop unless an Error device is still inside its own settle window (hard cap
+        # missing + settle, so a mouse that reappeared late still gets its full settle time)
+        $settling = @($d.Error | Where-Object { ($t - $errSince[$_]) -lt $MouseSettleSeconds })
+        if ($t -ge $MouseMissingSeconds -and ($settling.Count -eq 0 -or $t -ge ($MouseMissingSeconds + $MouseSettleSeconds))) { break }
         Start-Sleep -Seconds 1; $t++
     }
     return @(@($d.Error) + @($d.Missing) | Sort-Object)
