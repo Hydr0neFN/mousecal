@@ -85,24 +85,20 @@
         <p id="rdSmall" class="small-note" data-i18n="smallNote"></p>
         <ul id="rdWarnings" class="warnings"></ul>
 
-        <div id="verdictBox" class="verdict" hidden>
-          <div class="verdict-head">
-            <svg id="verdictIcon" class="vicon" viewBox="0 0 24 24" aria-hidden="true"></svg>
-            <p id="verdictText" class="verdict-text"></p>
-          </div>
-          <p id="beforeAfter" class="before-after"></p>
-          <div id="driverHint" class="hint" hidden>
-            <p class="hint-title" data-i18n="drvTitle"></p>
-            <ul>
-              <li data-i18n="drv1"></li>
-              <li data-i18n="drv2"></li>
-              <li data-i18n="drv3"></li>
-            </ul>
-            <p class="hint-cmd-label" data-i18n="drvCheck"></p>
-            <pre class="cmd small-cmd" id="drvCmd">Get-CimInstance Win32_SystemDriver -Filter "Name='rawaccel'" | Select-Object Name, State</pre>
-          </div>
-          <p id="failNext" class="fail-next" hidden></p>
-          <button id="btnFailApply" class="btn big accent" type="button" hidden data-i18n="btnApply"></button>
+        <div id="shakyBox" class="shaky" hidden>
+          <p class="shaky-text" data-i18n="shakyNote"></p>
+          <button id="btnShaky" class="btn small ghost" type="button" data-i18n="btnShakyRemeasure"></button>
+        </div>
+        <p id="beforeAfter" class="before-after" hidden></p>
+        <div id="driverHint" class="hint" hidden>
+          <p class="hint-title" data-i18n="drvTitle"></p>
+          <ul>
+            <li data-i18n="drv1"></li>
+            <li data-i18n="drv2"></li>
+            <li data-i18n="drv3"></li>
+          </ul>
+          <p class="hint-cmd-label" data-i18n="drvCheck"></p>
+          <pre class="cmd small-cmd" id="drvCmd">Get-CimInstance Win32_SystemDriver -Filter "Name='rawaccel'" | Select-Object Name, State</pre>
         </div>
 
         <details class="stats">
@@ -112,6 +108,13 @@
             <p class="hist-title" data-i18n="histTitle"></p>
             <svg id="hist" viewBox="0 0 320 120" role="img" aria-label="Histogram"></svg>
           </div>
+          <details class="dev">
+            <summary data-i18n="devTitle"></summary>
+            <div class="adv-actions">
+              <button id="btnDownloadCsv" class="btn small ghost" type="button" data-i18n="btnDownloadCsv"></button>
+            </div>
+            <p id="csvInfo" class="small-note"></p>
+          </details>
         </details>
       </div>
     </div>
@@ -130,7 +133,9 @@
         </header>
 
         <div class="oneclick" id="oneClick">
+          <p id="goodWin" class="good" hidden data-i18n="goodNow"></p>
           <button id="btnApply" class="btn big accent" type="button" data-i18n="btnApply"></button>
+          <p id="applyAmount" class="small-note apply-amount"></p>
           <p id="oneClickMsg" class="copy-msg" role="status" aria-live="polite"></p>
           <p id="ocState" class="small-note"></p>
           <p class="small-note" data-i18n="ocNote"></p>
@@ -205,6 +210,7 @@
           <svg id="wedge" viewBox="0 0 260 260" role="img" aria-label="Rotation diagram"></svg>
         </figure>
 
+        <p id="goodPhys" class="good" hidden data-i18n="goodNow"></p>
         <ol class="big-steps">
           <li>
             <div class="step-body">

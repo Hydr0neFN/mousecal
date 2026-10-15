@@ -231,3 +231,45 @@ test('sticky bar respects safe-area insets and the page gets bottom padding', ()
   assert.ok(/env\(safe-area-inset-bottom\)/.test(css) && /body\.has-bar\s*\{[^}]*padding-bottom/.test(css));
   assert.ok(/viewport-fit=cover/.test(read('index.html')));
 });
+
+test('no pass / fail verdict wording; positive "already fixed" only; number sits under the apply button', () => {
+  for (const lang of ['zh', 'en']) {
+    for (const k of ['verdictPass', 'verdictFail', 'failNextWin', 'failNextPhys', 'failNextAny', 'warnLow', 'warnInconsistent']) {
+      assert.ok(!(k in STRINGS[lang]), `${lang}.${k} should be gone`);
+    }
+  }
+  for (const [k, v] of Object.entries(STRINGS.zh)) assert.ok(!/過關|通過|還沒過|沒有藏東西|合格/.test(v), `zh.${k}: ${v}`);
+  for (const [k, v] of Object.entries(STRINGS.en)) assert.ok(!/\bpass\b|\bPass!|Not yet|nothing hidden/i.test(v), `en.${k}: ${v}`);
+  assert.equal(STRINGS.zh.discTitle, '這個指令會做什麼');
+  assert.equal(STRINGS.zh.goodNow, '已經修好了 ✓');
+  assert.equal(STRINGS.zh.applyAmount, '會修正 {r}°');
+  assert.equal(STRINGS.zh.applyAmountAgain, '會再補上 {r}°');
+  const html = read('index.html'), app = read('app.js');
+  assert.ok(!/verdictBox|btnFailApply|failNext/.test(html + app));
+  assert.ok(html.indexOf('id="btnApply"') < html.indexOf('id="applyAmount"'));
+  assert.ok(/A\.verdict\(th, 'software'\)/.test(app) && /A\.verdict\(th, 'physical'\)/.test(app));
+});
+
+test('shaky note: gentle hint with a re-measure button, driven by isShaky, never disables install', () => {
+  const html = read('index.html'), app = read('app.js');
+  assert.ok(html.includes('id="shakyBox"') && html.includes('id="btnShaky"'));
+  assert.ok(/A\.isShaky\(/.test(app) && app.includes("'btnShaky'"));
+  assert.equal(STRINGS.zh.shakyNote, '這次每次揮動的差異比較大，數字可能不太準。');
+  assert.equal(STRINGS.zh.btnShakyRemeasure, '再量一次（建議）');
+  assert.ok(!/btnApply'\)\.disabled\s*=.*isShaky/.test(app));
+});
+
+test('raw-data CSV download: collapsed developer details, memory only, Blob + download link', () => {
+  const html = read('index.html'), app = read('app.js');
+  const dev = /<details class="dev">[\s\S]*?<\/details>/.exec(html);
+  assert.ok(dev && !/\sopen[\s>]/.test(dev[0].split('>')[0] + '>'), 'closed by default');
+  assert.ok(dev[0].includes('id="btnDownloadCsv"') && dev[0].includes('id="csvInfo"'));
+  assert.ok(html.indexOf('class="stats"') < html.indexOf('class="dev"'), 'inside the details section');
+  assert.equal(STRINGS.zh.btnDownloadCsv, '下載這次的原始資料（CSV）');
+  assert.equal(STRINGS.zh.devTitle, '開發者選項');
+  assert.ok(/capturesToCsv\(/.test(app) && /captureFilename\(/.test(app) && /new Blob\(/.test(app));
+  const store = read('store.js');
+  assert.ok(!/capture/.test(store) && !/serializeStore\([^)]*capture/.test(app), 'raw samples are not persisted');
+  const save = /function save\(\)[\s\S]*?\n\}/.exec(app)[0];
+  assert.ok(!/capture|samples/.test(save));
+});

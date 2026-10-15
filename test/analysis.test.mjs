@@ -256,3 +256,37 @@ test('analyzeTimed = trimTail + dropLast: the stop-key swing at the end cannot s
   // options pass through
   assert.equal(A.analyzeTimed(good, end + 300, { minStrokes: 1000 }).confidence, 'insufficient');
 });
+
+test('isShaky: se > 1, std > 5, n < 20 or right/left gap > 4 deg flags the result; a steady one does not', () => {
+  const ok = { median: 8, n: 30, se: 0.8, std: 3, rightMedian: 8.5, leftMedian: 7.5 };
+  assert.equal(A.isShaky(ok), false);
+  assert.equal(A.isShaky({ ...ok, se: 1.0 }), false);   // boundaries are inclusive of "fine"
+  assert.equal(A.isShaky({ ...ok, se: 1.01 }), true);
+  assert.equal(A.isShaky({ ...ok, std: 5 }), false);
+  assert.equal(A.isShaky({ ...ok, std: 5.01 }), true);
+  assert.equal(A.isShaky({ ...ok, n: 20 }), false);
+  assert.equal(A.isShaky({ ...ok, n: 19 }), true);
+  assert.equal(A.isShaky({ ...ok, rightMedian: 10, leftMedian: 6 }), false);
+  assert.equal(A.isShaky({ ...ok, rightMedian: 10.1, leftMedian: 6 }), true);
+  assert.equal(A.isShaky({ ...ok, rightMedian: 5, leftMedian: 10 }), true);
+  assert.equal(A.isShaky({ ...ok, rightMedian: null, leftMedian: null }), false);   // one-sided: nothing to compare
+  assert.equal(A.isShaky({ ...ok, se: NaN }), true);
+  assert.equal(A.isShaky(null), false);
+  assert.equal(A.isShaky({ median: null, n: 0, se: 0, std: 0 }), false);            // nothing measured: no note
+});
+
+test('capture export: CSV header t,dx,dy,device; seconds relative to the first sample; integer dx/dy', () => {
+  const s = [{ t: 1000.5, dx: 3, dy: -1 }, { t: 1008.5, dx: -2.4, dy: 0 }, { t: 2500.5, dx: 1, dy: 7 }];
+  const lines = A.capturesToCsv(s, true).trimEnd().split('\n');
+  assert.equal(lines[0], 't,dx,dy,device');
+  assert.equal(lines.length, 4);
+  assert.equal(lines[1], '0.000000,3,-1,browser-unadjusted');
+  assert.equal(lines[2], '0.008000,-2,0,browser-unadjusted');
+  assert.equal(lines[3], '1.500000,1,7,browser-unadjusted');
+  assert.ok(A.capturesToCsv(s, false).includes(',browser-adjusted'));
+  assert.ok(A.capturesToCsv(s, null).includes(',browser-adjusted'));
+  assert.equal(A.capturesToCsv([], true), 't,dx,dy,device\n');
+  assert.equal(A.captureSeconds(s), 1.5);
+  assert.equal(A.captureSeconds([]), 0);
+  assert.equal(A.captureFilename(new Date(2026, 9, 5, 7, 8, 9)), 'mousecal-capture-20261005-070809.csv');
+});

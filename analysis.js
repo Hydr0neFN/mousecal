@@ -326,6 +326,41 @@ export function verdict(theta, path) {
   return Number.isFinite(theta) && Math.abs(theta) <= THRESHOLDS[path] ? 'pass' : 'fail';
 }
 
+// ------------------------------------------------------------ consistency
+// A gentle hint, never a gate: true when the swipes disagree enough that the number may be off.
+// se > 1 deg, spread (std) > 5 deg, fewer than 20 strokes, or right/left medians more than 4 deg apart.
+export const SHAKY = { se: 1.0, std: 5, minN: 20, lrDiff: 4 };
+export function isShaky(res) {
+  if (!res || !Number.isFinite(res.median)) return false;
+  if (!(res.n >= SHAKY.minN)) return true;
+  if (!(res.se <= SHAKY.se) || !(res.std <= SHAKY.std)) return true;
+  if (Number.isFinite(res.rightMedian) && Number.isFinite(res.leftMedian)
+      && Math.abs(res.rightMedian - res.leftMedian) > SHAKY.lrDiff) return true;
+  return false;
+}
+
+// ------------------------------------------------------------ raw capture export
+// samples: [{t (ms), dx, dy}]. t is written in seconds relative to the first sample; dx/dy as integers.
+export function capturesToCsv(samples, unadjusted) {
+  const device = unadjusted === true ? 'browser-unadjusted' : 'browser-adjusted';
+  const list = samples || [];
+  const t0 = list.length ? list[0].t : 0;
+  const rows = ['t,dx,dy,device'];
+  for (const s of list) {
+    rows.push(((s.t - t0) / 1000).toFixed(6) + ',' + Math.round(s.dx) + ',' + Math.round(s.dy) + ',' + device);
+  }
+  return rows.join('\n') + '\n';
+}
+export function captureFilename(d) {
+  const p = (v) => String(v).padStart(2, '0');
+  return 'mousecal-capture-' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-'
+    + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds()) + '.csv';
+}
+// seconds between the first and last sample
+export function captureSeconds(samples) {
+  return samples && samples.length > 1 ? (samples[samples.length - 1].t - samples[0].t) / 1000 : 0;
+}
+
 // ------------------------------------------------------------ settings.json
 const ROTATION_RE = /("Degrees of rotation"\s*:\s*)-?\d+(\.\d+)?([eE][+-]?\d+)?/g;
 
@@ -343,7 +378,7 @@ export function rawAccelSettings(templateJsonString, theta) {
 const api = {
   DEFAULTS, THRESHOLDS, fold, vecAngle, pcaAngle, median, mean, stdev, quantile, weightedMedianOf,
   smooth, zigzag, segmentStrokes, confidenceLabel, histogram, summarize, analyze,
-  trimTail, analyzeTimed, verdict, rawAccelSettings
+  trimTail, analyzeTimed, verdict, isShaky, SHAKY, capturesToCsv, captureFilename, captureSeconds, rawAccelSettings
 };
 if (typeof window !== 'undefined') globalThis.MouseCalAnalysis = api;
 export default api;

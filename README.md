@@ -35,7 +35,7 @@ verifies the SHA256 before using it.
 | --- | --- |
 | `index.html`, `style.css` | The page. Self-contained; only Google Fonts are loaded externally. |
 | `app.js` | Pointer-lock measurement, live trail, result, re-measure, copy buttons. |
-| `analysis.js` | Pure functions (ES module, no DOM): stroke segmentation, statistics, `trimTail` / `analyzeTimed` (timed recordings), `verdict`, `rawAccelSettings`. |
+| `analysis.js` | Pure functions (ES module, no DOM): stroke segmentation, statistics, `trimTail` / `analyzeTimed` (timed recordings), `verdict`, `isShaky`, CSV export helpers, `rawAccelSettings`. |
 | `store.js` | Pure helpers for the per-browser convenience record (`localStorage`: language, last result, path, pending flag). It is never used to compute a rotation. |
 | `commands.js` | The **one** place the page knows its own address (`SITE_BASE`) and the copied commands. |
 | `i18n.js` | All strings (zh-TW and English). |

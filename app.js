@@ -27,6 +27,7 @@ const S = {
   phase: 'idle',           // 'ready' (locked, waiting for movement) | 'run' | 'extend'
   firstT: 0, endAt: 0, endT: 0, extended: false,
   samples: [],
+  capture: null,           // { samples, events, unadjusted } raw data of the last run; memory only, never stored
   trail: [],
   px: 0, py: 0,
   unadjusted: null,        // true / false once a lock was granted
@@ -35,7 +36,7 @@ const S = {
 };
 let timers = { stop: 0, live: 0, raf: 0 };
 let lockPending = false;
-const REMEASURE_BTNS = ['btnRemeasureWin', 'btnRemeasurePhys', 'btnBar', 'btnWelcome'];
+const REMEASURE_BTNS = ['btnRemeasureWin', 'btnRemeasurePhys', 'btnBar', 'btnWelcome', 'btnShaky'];
 
 // ---------------------------------------------------------------- storage
 // Per-browser convenience only (welcome-back band, sticky bar). Never used to compute a rotation.
@@ -229,16 +230,17 @@ function renderResult() {
   const add = (txt) => { const li = document.createElement('li'); li.textContent = txt; w.append(li); };
   if (res.warnings.includes('few-strokes') && res.n > 0) add(t('warnFew'));
   if (res.warnings.includes('wrist-arc')) add(t('warnWrist', { d: num(Math.abs(res.lrDiff)), r: signed(res.rightMedian), l: signed(res.leftMedian) }));
-  if (res.warnings.includes('inconsistent')) add(t('warnInconsistent', { s: num(res.std) }));
-  if (res.confidence === 'low') add(t('warnLow'));
 
   renderDial(th, res.n >= 2 ? res.se : null);
   renderStats(res);
   renderHist(res);
-  renderVerdict();
+  renderHints();
 }
 
 function renderStats(res) {
+  const c = S.capture;
+  $('btnDownloadCsv').disabled = !c;
+  $('csvInfo').textContent = c ? t('csvInfo', { n: c.events, s: num(A.captureSeconds(c.samples)) }) : t('csvNone');
   const dl = $('statsList');
   dl.replaceChildren();
   const rows = [
@@ -266,37 +268,16 @@ function driverInactive() {
   return th != null && Math.abs(S.before.theta) >= 2 && Math.abs(th - S.before.theta) < 1.5;
 }
 
-function renderVerdict() {
-  const box = $('verdictBox');
+// A gentle note when the swipes disagree (never blocks anything), the before/after numbers, and the driver hint.
+function renderHints() {
   const r = S.result;
+  $('shakyBox').hidden = !A.isShaky(r.res);
+  $('btnShaky').disabled = S.measuring;
   const show = S.mode === 'remeasure' && r.remeasured && r.res.confidence !== 'insufficient' && r.res.median != null;
-  box.hidden = !show;
-  $('oneClick').classList.remove('hot');
-  if (!show) return;
-  const vp = verdictPath(S.path);      // unknown path is held to the stricter (Windows) standard
-  const th = r.res.median, thr = A.THRESHOLDS[vp];
-  const ok = A.verdict(th, vp) === 'pass';
-  box.dataset.state = ok ? 'pass' : 'fail';
-  const icon = $('verdictIcon');
-  icon.replaceChildren(ok
-    ? svgEl('polyline', { points: '4 12.5 9.5 18 20 6' })
-    : svgEl('path', { d: 'M5 5 L19 19 M19 5 L5 19' }));
-  $('verdictText').textContent = t(ok ? 'verdictPass' : 'verdictFail', { thr });
-  $('beforeAfter').textContent = S.before ? t('beforeAfter', { a: signed(S.before.theta), b: signed(th) }) : '';
-  $('beforeAfter').hidden = !S.before;
-  const hint = !ok && driverInactive();
-  $('driverHint').hidden = !hint;
-  const fn = $('failNext');
-  fn.hidden = ok || hint;
-  // failed on the Windows path: applying the fix again is the one big next step
-  const again = !ok && !hint && S.path === 'software';
-  $('btnFailApply').hidden = !again;
-  $('btnFailApply').disabled = !canCopy();
-  $('oneClick').classList.toggle('hot', again);
-  if (!ok && !hint) {
-    if (S.path === 'physical') fn.textContent = t('failNextPhys', { a: num(Math.abs(th)), dir: t(th > 0 ? 'dirCCW' : 'dirCW') });
-    else fn.textContent = t(S.path === 'software' ? 'failNextWin' : 'failNextAny', { r: signed(th) });
-  }
+  const ba = $('beforeAfter');
+  ba.hidden = !(show && S.before);
+  if (!ba.hidden) ba.textContent = t('beforeAfter', { a: signed(S.before.theta), b: signed(r.res.median) });
+  $('driverHint').hidden = !(show && Math.abs(r.res.median) > A.THRESHOLDS.software && driverInactive());
 }
 
 // ---------------------------------------------------------------- fix paths
@@ -313,6 +294,18 @@ function renderFix() {
   if (!ok) note.textContent = '';
   else if (Math.abs(th) < 0.5) note.textContent = t('cmdNoteTiny', { r: signed(th) });
   else note.textContent = t('cmdNoteReady', { r: signed(rot) });
+
+  // the measured number under the main button; when it is already good, say so and make the buttons secondary
+  const again = !!S.result && S.result.remeasured;
+  $('applyAmount').textContent = ok ? t(again ? 'applyAmountAgain' : 'applyAmount', { r: signed(rot) + '°' }) : '';
+  const goodWin = ok && A.verdict(th, 'software') === 'pass';
+  const goodPhys = ok && A.verdict(th, 'physical') === 'pass';
+  $('goodWin').hidden = !goodWin;
+  $('goodPhys').hidden = !goodPhys;
+  for (const [id, good] of [['btnApply', goodWin], ['btnRemeasurePhys', goodPhys]]) {
+    $(id).classList.toggle('accent', !good);
+    $(id).classList.toggle('ghost', good);
+  }
 
   // one-click link (mousecal:// protocol, registered by an earlier install); only the measured angle is in the link
   const tooBig = ok && !oneClickOk(rot);
@@ -346,7 +339,7 @@ function renderBanner() {
   if (S.mode !== 'remeasure') { b.hidden = true; return; }
   b.hidden = false;
   const span = document.createElement('span');
-  span.textContent = t(S.path === 'software' ? 'modeReWin' : S.path === 'physical' ? 'modeRePhys' : 'modeReAny', { thr: A.THRESHOLDS[verdictPath(S.path)] });
+  span.textContent = t(S.path === 'software' ? 'modeReWin' : S.path === 'physical' ? 'modeRePhys' : 'modeReAny');
   b.append(span);   // starting over lives in one place only: the welcome band's reset link
 }
 
@@ -612,7 +605,7 @@ function onLockChange() {
 function beginMeasure() {
   S.measuring = true;
   S.phase = 'ready'; S.extended = false; S.firstT = 0; S.endAt = 0; S.endT = 0; S.liveN = 0;
-  S.samples = []; S.trail = []; S.px = 0; S.py = 0; S.viewScale = 0;
+  S.samples = []; S.events = 0; S.trail = []; S.px = 0; S.py = 0; S.viewScale = 0;
   S.attempt = null;
   document.querySelector('.pad-frame').classList.add('locked');
   $('hud').hidden = false;
@@ -628,6 +621,7 @@ function beginMeasure() {
 function onMove(e) {
   if (document.pointerLockElement !== padCanvas()) return;
   const dx = e.movementX || 0, dy = e.movementY || 0;
+  S.events++;
   if (!dx && !dy) return;
   const t0 = e.timeStamp || performance.now();
   const now = performance.now();
@@ -673,6 +667,7 @@ function endMeasure() {
   const endT = S.endT || performance.now();
   S.phase = 'idle';
 
+  S.capture = { samples: S.samples.slice(), events: S.events, unadjusted: S.unadjusted === true };
   const res = scoreAt(endT);
   if (res.confidence !== 'insufficient') {
     const prev = S.last;
@@ -748,7 +743,7 @@ function init() {
   $('btnBar').addEventListener('click', () => startRemeasure(S.path));
 
   $('btnApply').addEventListener('click', doApply);
-  $('btnFailApply').addEventListener('click', doApply);
+  $('btnShaky').addEventListener('click', () => startRemeasure(S.path));
   $('btnOneClickUn').addEventListener('click', doUninstall);
   $('btnCopyInstall').addEventListener('click', async () => {
     if (!canCopy()) return;
@@ -767,6 +762,16 @@ function init() {
     const blob = new Blob([$('jsonOut').value], { type: 'application/json' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob); a.download = 'settings.json';
+    document.body.append(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  });
+
+  $('btnDownloadCsv').addEventListener('click', () => {
+    const c = S.capture;
+    if (!c) return;
+    const blob = new Blob([A.capturesToCsv(c.samples, c.unadjusted)], { type: 'text/csv' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = A.captureFilename(new Date());
     document.body.append(a); a.click(); a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   });
