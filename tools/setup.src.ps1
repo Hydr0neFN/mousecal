@@ -1149,7 +1149,7 @@ function Restore-UrlProtocolSnapshot($Snap, [string]$Key = '') {
 
 # Removes the registry key (only if it points at our handler) and our three files; the folder
 # goes too when nothing else is in it. Never throws for things that are already gone.
-function Unregister-UrlProtocol([string]$Dir = '', [string]$Key = '', [switch]$Owned) {
+function Unregister-UrlProtocol([string]$Dir = '', [string]$Key = '', [switch]$Owned, [switch]$FilesOwned) {
     if (-not $Dir) { $Dir = Get-HandlerDir }
     if (-not $Key) { $Key = $ProtocolKey }
     if (Test-Path -LiteralPath $Key) {
@@ -1163,6 +1163,7 @@ function Unregister-UrlProtocol([string]$Dir = '', [string]$Key = '', [switch]$O
             (-not $cmd -and $default -eq 'URL:mousecal Protocol')) {
             Remove-Item -LiteralPath $Key -Recurse -Force
         } else {
+            $script:ProtocolLeftAlone = $true
             Warn 'Registry key {0} points somewhere else ({1}); it is left alone.' '登錄機碼 {0} 指向別的地方（{1}）；不動它。' @($Key, $cmd)
         }
     }
@@ -1173,17 +1174,21 @@ function Unregister-UrlProtocol([string]$Dir = '', [string]$Key = '', [switch]$O
         if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { continue }
         $head = ''
         try { $head = [string](Get-Content -LiteralPath $f -TotalCount 6 -ErrorAction Stop) -join "`n" } catch { }
-        if ($Owned -or $head.IndexOf($sig[$n], [StringComparison]::Ordinal) -ge 0) { Remove-Item -LiteralPath $f -Force }
-        else { Warn '{0} was not written by this tool; it is left alone.' '{0} 不是這個工具寫入的；不動它。' @($f) }
+        if ($Owned -or $FilesOwned -or $head.IndexOf($sig[$n], [StringComparison]::Ordinal) -ge 0) { Remove-Item -LiteralPath $f -Force }
+        else { $script:ProtocolLeftAlone = $true; Warn '{0} was not written by this tool; it is left alone.' '{0} 不是這個工具寫入的；不動它。' @($f) }
     }
     Remove-EmptyDirs $Dir
 }
 
 # Uninstall step (honours -DryRun); a problem here never aborts the rest of the uninstall.
-function Remove-UrlProtocolStep([switch]$Owned) {
+function Remove-UrlProtocolStep([switch]$Owned, [switch]$FilesOwned) {
     if (-not (Test-UrlProtocolPresent)) { return }
     if ($DryRun) { Dry 'Remove the mousecal:// URL protocol ({0}) and the handler folder {1}' '移除 mousecal:// 網址通訊協定（{0}）與處理程式資料夾 {1}' @($ProtocolKey, (Get-HandlerDir)); return }
-    try { Unregister-UrlProtocol -Owned:$Owned; Ok 'Removed the mousecal:// URL protocol and {0}.' '已移除 mousecal:// 網址通訊協定與 {0}。' @((Get-HandlerDir)) }
+    try {
+        $script:ProtocolLeftAlone = $false
+        Unregister-UrlProtocol -Owned:$Owned -FilesOwned:$FilesOwned
+        if (-not $script:ProtocolLeftAlone) { Ok 'Removed the mousecal:// URL protocol and {0}.' '已移除 mousecal:// 網址通訊協定與 {0}。' @((Get-HandlerDir)) }
+    }
     catch { Warn 'Could not fully remove the mousecal:// link ({0}). It is harmless; delete {1} and the registry key {2} by hand if you want.' '無法完整移除 mousecal:// 連結（{0}）。它無害；想清掉的話請手動刪除 {1} 與登錄機碼 {2}。' @($_.Exception.Message, (Get-HandlerDir), $ProtocolKey) }
 }
 
@@ -1471,7 +1476,9 @@ function Invoke-Uninstall {
 
     # a valid marker proves this tool registered them (and an install always replaces a same-named task)
     Remove-ApplyTask -Owned
-    Remove-UrlProtocolStep -Owned
+    # the registry key is always ownership-checked (the marker does not record the protocol step); the handler
+    # files sit inside our own install root, which the marker vouches for
+    Remove-UrlProtocolStep -FilesOwned
 
     # --- files
     if ($marker.createdAppDir) {

@@ -756,7 +756,7 @@ try {
     # panel: a same-named task that is NOT ours is never removed
     Check 'panel: Test-OwnApplyTask accepts our writer.exe task' (Test-OwnApplyTask ([pscustomobject]@{ Actions = @([pscustomobject]@{ Execute = (Join-Path $AppDir 'writer.exe'); Arguments = '"x"' }) }))
     Check 'panel: Test-OwnApplyTask accepts the legacy wscript + apply-rawaccel.vbs task' (Test-OwnApplyTask ([pscustomobject]@{ Actions = @([pscustomobject]@{ Execute = 'wscript.exe'; Arguments = ('"' + $VbsPath + '"') }) }))
-    Check 'panel: Test-OwnApplyTask rejects a foreign task with the same name' (-not (Test-OwnApplyTask ([pscustomobject]@{ Actions = @([pscustomobject]@{ Execute = 'C:\Toolsackup.exe'; Arguments = '' }) })))
+    Check 'panel: Test-OwnApplyTask rejects a foreign task with the same name' (-not (Test-OwnApplyTask ([pscustomobject]@{ Actions = @([pscustomobject]@{ Execute = 'C:\Tools\backup.exe'; Arguments = '' }) })))
     Check 'panel: Test-OwnApplyTask rejects a task with no action' (-not (Test-OwnApplyTask ([pscustomobject]@{ Actions = @() })))
     Check 'F5 intact installed uninstaller is used as is' ($script:lastTool -eq (Join-Path $script:AppDir 'uninstaller.exe'))
     New-Sandbox; [IO.File]::WriteAllText($script:MarkerPath, $oldMarker); [IO.File]::WriteAllText((Join-Path $script:AppDir 'uninstaller.exe'), 'TAMPERED')
