@@ -5,3 +5,15 @@
 /*
   X-Content-Type-Options: nosniff
   Referrer-Policy: no-referrer
+
+/*.js
+  Cache-Control: no-cache
+
+/
+  Cache-Control: no-cache
+
+/index.html
+  Cache-Control: no-cache
+
+/*.css
+  Cache-Control: no-cache
