@@ -192,17 +192,6 @@
           <p class="small-note" data-i18n-html="defender"></p>
         </section>
 
-        <section class="uninstall" aria-labelledby="h-un">
-          <h3 id="h-un" data-i18n="unTitle"></h3>
-          <button id="btnOneClickUn" class="btn small" type="button" data-i18n="btnOneClickUn"></button>
-          <span id="oneClickUnMsg" class="copy-msg inline" role="status" aria-live="polite"></span>
-          <p class="small-note" data-i18n="unOneNote"></p>
-          <p class="small-note"><code id="unUrl"></code></p>
-          <div id="unManual" hidden>
-            <p class="small-note" data-i18n="unHow"></p>
-            <pre id="cmdUninstall" class="cmd small-cmd" tabindex="0"></pre>
-          </div>
-        </section>
       </article>
 
       <!-- Physical -->
@@ -270,6 +259,17 @@
 </div>
 
 <footer class="foot">
+  <section class="uninstall" aria-labelledby="h-un">
+    <h3 id="h-un" data-i18n="unTitle"></h3>
+    <button id="btnOneClickUn" class="btn small ghost" type="button" data-i18n="btnOneClickUn"></button>
+    <span id="oneClickUnMsg" class="copy-msg inline" role="status" aria-live="polite"></span>
+    <p class="small-note" data-i18n="unOneNote"></p>
+    <p class="small-note" hidden><code id="unUrl"></code></p>
+    <div id="unManual" hidden>
+      <p class="small-note" data-i18n="unHow"></p>
+      <pre id="cmdUninstall" class="cmd small-cmd" tabindex="0"></pre>
+    </div>
+  </section>
   <p data-i18n="footPrivacy"></p>
   <p data-i18n-html="footCredit"></p>
 </footer>

@@ -313,14 +313,12 @@ function renderFix() {
   if (!ok) note.textContent = '';
   else if (Math.abs(th) < 0.5) note.textContent = t('cmdNoteTiny', { r: signed(th) });
   else note.textContent = t('cmdNoteReady', { r: signed(rot) });
-  $('cmdUninstall').textContent = uninstallCommand();
 
   // one-click link (mousecal:// protocol, registered by an earlier install); only the measured angle is in the link
   const tooBig = ok && !oneClickOk(rot);
   $('ocUrl').textContent = ok && !tooBig ? applyUrl(rot) : '';
   $('ocUrl').classList.toggle('dim', !ok || tooBig);
   $('ocState').textContent = tooBig ? t('ocTooBig', { r: signed(rot) }) : '';
-  $('unUrl').textContent = uninstallUrl();
 
   // physical path
   const instr = $('physInstr');
@@ -348,11 +346,8 @@ function renderBanner() {
   if (S.mode !== 'remeasure') { b.hidden = true; return; }
   b.hidden = false;
   const span = document.createElement('span');
-  span.textContent = t(S.path === 'software' ? 'modeReWin' : S.path === 'physical' ? 'modeRePhys' : 'modeReAny', { thr: A.THRESHOLDS[verdictPath(S.path)] }) + ' ';
-  const back = document.createElement('button');
-  back.type = 'button'; back.className = 'btn small ghost'; back.textContent = t('modeBack');
-  back.addEventListener('click', () => { if (S.measuring) return; S.mode = 'measure'; S.before = null; renderAll(); });
-  b.append(span, back);
+  span.textContent = t(S.path === 'software' ? 'modeReWin' : S.path === 'physical' ? 'modeRePhys' : 'modeReAny', { thr: A.THRESHOLDS[verdictPath(S.path)] });
+  b.append(span);   // starting over lives in one place only: the welcome band's reset link
 }
 
 function renderWelcome() {
@@ -404,7 +399,8 @@ function markPending(path) {
   renderBar();
 }
 function renderBar() {
-  const bar = S.pendingApply && !S.measuring;
+  // one "measure again" entry at a time: the welcome band already has the big button at the top
+  const bar = S.pendingApply && !S.measuring && $('welcome').hidden;
   $('remeasureBar').hidden = !bar;
   document.body.classList.toggle('has-bar', bar);
 }
@@ -446,7 +442,6 @@ function doApply() {
 
 function doUninstall() {
   if (S.measuring) return;
-  markPending('software');
   runLinkAction({ url: uninstallUrl(), command: uninstallCommand(), node: $('cmdUninstall'), msgEl: $('oneClickUnMsg'), manualId: 'unManual' });
 }
 
@@ -778,6 +773,9 @@ function init() {
 
   if (window.ResizeObserver) new ResizeObserver(() => { if (!S.measuring) drawPad(); }).observe(pad);
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', () => { renderAll(); });
+  // uninstall lives in the footer and never depends on a measurement
+  $('cmdUninstall').textContent = uninstallCommand();
+  $('unUrl').textContent = uninstallUrl();
   renderAll();
 }
 
