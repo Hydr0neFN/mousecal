@@ -322,7 +322,8 @@ test('disclosure describes the launcher: downloads setup.ps1, checks SHA256 agai
 });
 
 test('README documents the launcher, the hash, the folder and the ClickFix reasoning', () => {
-  const r = read('README.md');
+  const r = read('README.md') + read('README.zh-TW.md');   // English + Traditional Chinese docs, linked to each other
+  assert.ok(read('README.md').includes('README.zh-TW.md') && read('README.zh-TW.md').includes('README.md'), 'the two READMEs must link to each other');
   for (const needle of ['mousecal-setup-', 'mousecal-uninstall.cmd', 'setup-hash.js', 'SETUP_SHA256', 'fltmc', 'WebClient', 'mousecal-elevated', '%ProgramData%\\mousecal-dl-<guid>', 'ClickFix', 'MOUSECAL_BUILD_OUT', 'launcher.test.mjs', '下載安裝程式']) {
     assert.ok(r.includes(needle), 'README lacks ' + needle);
   }
