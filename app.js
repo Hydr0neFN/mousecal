@@ -3,7 +3,8 @@ import * as A from './analysis.js';
 import { SETTINGS_TEMPLATE } from './settings-template.js';
 import { STRINGS } from './i18n.js';
 import { normalizeStore, serializeStore, verdictPath, shortDate, installedAfter } from './store.js';
-import { installCommand, uninstallCommand, applyUrl, uninstallUrl, formatRotation, ONE_CLICK_MAX } from './commands.js';
+import { installCommand, uninstallCommand, applyUrl, uninstallUrl, formatRotation, ONE_CLICK_MAX, launcherCmd, launcherFilename } from './commands.js';
+import { SETUP_SHA256 } from './setup-hash.js';
 
 const $ = (id) => document.getElementById(id);
 const BASE_MS = 10000;       // countdown starts on the first movement
@@ -306,7 +307,8 @@ function renderFix() {
   const cmd = $('cmdInstall');
   cmd.textContent = installCommand(rot);
   cmd.classList.toggle('dim', !ok);
-  $('btnApply').disabled = !ok;
+  $('btnDownload').disabled = !ok;
+  $('btnFallbackDownload').disabled = !ok;
   $('btnCopyInstall').disabled = !ok;
   const note = $('cmdNote');
   if (!ok) note.textContent = '';
@@ -320,7 +322,7 @@ function renderFix() {
   const goodPhys = ok && A.verdict(th, 'physical') === 'pass';
   $('goodWin').hidden = !goodWin;
   $('goodPhys').hidden = !goodPhys;
-  for (const [id, good] of [['btnApply', goodWin], ['btnRemeasurePhys', goodPhys]]) {
+  for (const [id, good] of [['btnDownload', goodWin], ['btnApply', goodWin], ['btnRemeasurePhys', goodPhys]]) {
     $(id).classList.toggle('accent', !good);
     $(id).classList.toggle('ghost', good);
   }
@@ -330,6 +332,7 @@ function renderFix() {
   $('ocUrl').textContent = ok && !tooBig ? applyUrl(rot) : '';
   $('ocUrl').classList.toggle('dim', !ok || tooBig);
   $('ocState').textContent = tooBig ? t('ocTooBig', { r: signed(rot) }) : '';
+  $('btnApply').disabled = !ok;
 
   // physical path
   const instr = $('physInstr');
@@ -375,6 +378,7 @@ function renderAll() {
   for (const id of ['result', 'fix', 'advanced']) $(id).hidden = !has;
   renderWelcome();
   renderBar();
+  renderSteps();
   renderBanner();
   if (has) { renderResult(); renderFix(); }
   else for (const id of REMEASURE_BTNS) $(id).disabled = S.measuring;
@@ -390,11 +394,11 @@ function renderAll() {
 }
 
 // ----------------------------------------------------- mousecal:// links
-// Blur / visibility detection of protocol handlers is unreliable, so nothing branches on it. One click does:
-// (1) copy the command (inside the click, so it is still a user gesture), (2) open the link,
-// (3) show the "press Open / Yes" hint at once, (4) after FALLBACK_DELAY_MS show, and keep showing,
-// the manual steps for the case where nothing happened (not installed yet). Only the two links from
-// commands.js are ever opened.
+// Blur / visibility detection of protocol handlers is unreliable, so nothing branches on it. One click on
+// "Apply the fix" / "Uninstall" does: (1) open the link, (2) show the "press Open / Yes" hint at once,
+// (3) after FALLBACK_DELAY_MS show, and keep showing, a "No reaction? Download the installer" button for the case
+// where nothing happened (not installed yet). Nothing is ever downloaded or copied without a click on that button.
+// Only the two links from commands.js are ever opened.
 const FALLBACK_DELAY_MS = 3000;
 
 function say(msgEl, key, vars) {
@@ -416,35 +420,61 @@ function renderBar() {
   document.body.classList.toggle('has-bar', bar);
 }
 
-// `select` = the copy did NOT work: pre-select the command, say "press Ctrl+C", and never claim it was copied.
-function showManual(boxId, node, select) {
+// ---------------------------------------------------- downloaded launcher (.cmd)
+// The launcher is built here from commands.js (so it always carries the SHA256 of the setup.ps1 deployed with this
+// page) and handed to the browser as a file. The page never runs it.
+function launcherOptions(mode) {
+  return mode === 'uninstall' ? { mode, restoreEpp: restoreEpp() } : { mode, measured: measuredForCommand() };
+}
+function launcherName(mode) {
+  return launcherFilename(mode, measuredForCommand());
+}
+function downloadLauncher(mode) {
+  if (S.measuring || (mode === 'install' && !canCopy())) return false;
+  const text = launcherCmd(launcherOptions(mode));
+  const blob = new Blob([text], { type: 'application/octet-stream' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = launcherName(mode);
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  return true;
+}
+function showSteps(boxId) {
   const box = $(boxId);
   box.hidden = false;
-  for (const el of box.querySelectorAll('[data-i18n-ok]')) {
-    el.dataset.i18n = select ? el.dataset.i18nFail : el.dataset.i18nOk;
-    el.textContent = t(el.dataset.i18n, DEFAULT_VARS());
-  }
-  for (const el of box.querySelectorAll('.copy-hint')) el.hidden = !select;
-  box.classList.toggle('compact', S.installed);   // known to work before: smaller, but never hidden
-  if (select && node) selectNode(node);
+  box.classList.toggle('compact', boxId === 'unManual' || S.installed);   // known to work before: smaller, but never hidden
+  renderSteps();
   if (box.scrollIntoView) box.scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'nearest' });
 }
+function doDownload(mode) {
+  if (!downloadLauncher(mode)) return;
+  if (mode === 'install') {
+    markPending('software');
+    say($('dlMsg'), 'dlStarted', { file: launcherName('install') });
+    showSteps('manualSteps');
+  } else {
+    say($('oneClickUnMsg'), 'dlStarted', { file: launcherName('uninstall') });
+    showSteps('unManual');
+  }
+}
+// The file name inside step 1 depends on the measured angle (and on the language of the sentence).
+function renderSteps() {
+  $('dlStep1').textContent = t('dlS1', { file: launcherName('install') });
+  $('unStep1').textContent = t('unS1', { file: launcherName('uninstall') });
+}
 
-function runLinkAction({ url, command, node, msgEl, manualId }) {
-  const box = $(manualId);
+// Opens a mousecal:// link and, if nothing seems to happen, offers the download. url null = no link possible.
+function runLinkAction({ url, msgEl, fallbackId }) {
+  const box = $(fallbackId);
   clearTimeout(box._t);
   box.hidden = true;
-  const copied = copyQuiet(command, node);      // starts synchronously, inside the click
-  if (!url) {            // no link possible (angle beyond the one-click limit): the copied command is the way
+  if (!url) {            // no link possible (angle beyond the one-click limit): the download is the way
     msgEl.textContent = '';
-    copied.then((ok) => showManual(manualId, node, !ok));
+    box.hidden = false;
     return;
   }
   say(msgEl, 'applyPrompt');
-  copied.then((ok) => { if (!ok) say(msgEl, 'copySelected'); });
-  box._t = setTimeout(() => {
-    copied.then((ok) => showManual(manualId, node, !ok));
-  }, FALLBACK_DELAY_MS);
+  box._t = setTimeout(() => { box.hidden = false; }, FALLBACK_DELAY_MS);
   window.location.assign(url);
 }
 
@@ -454,7 +484,7 @@ function doApply() {
   let url = null;
   if (oneClickOk(rot)) { try { url = applyUrl(rot); } catch { url = null; } }
   markPending('software');
-  runLinkAction({ url, command: installCommand(rot), node: $('cmdInstall'), msgEl: $('oneClickMsg'), manualId: 'manualSteps' });
+  runLinkAction({ url, msgEl: $('oneClickMsg'), fallbackId: 'fallbackBox' });
 }
 
 // The footer checkbox: also put Windows "Enhance pointer precision" back (checked by default).
@@ -467,7 +497,7 @@ function refreshUninstall() {
 function doUninstall() {
   if (S.measuring) return;
   refreshUninstall();
-  runLinkAction({ url: uninstallUrl(restoreEpp()), command: uninstallCommand(restoreEpp()), node: $('cmdUninstall'), msgEl: $('oneClickUnMsg'), manualId: 'unManual' });
+  runLinkAction({ url: uninstallUrl(restoreEpp()), msgEl: $('oneClickUnMsg'), fallbackId: 'unFallbackBox' });
 }
 
 // -------------------------------------------------------------- copy helper
@@ -786,17 +816,25 @@ function init() {
   $('btnBar').addEventListener('click', () => startRemeasure(S.path));
 
   $('btnApply').addEventListener('click', doApply);
+  $('btnDownload').addEventListener('click', () => doDownload('install'));
+  $('btnFallbackDownload').addEventListener('click', () => doDownload('install'));
+  $('btnDownloadUn').addEventListener('click', () => doDownload('uninstall'));
+  $('btnUnFallbackDownload').addEventListener('click', () => doDownload('uninstall'));
+  $('setupHash').textContent = SETUP_SHA256;
   $('btnShaky').addEventListener('click', () => startRemeasure(S.path));
   $('btnOneClickUn').addEventListener('click', doUninstall);
+  // Advanced: the old Win+R command, copy only (never done automatically)
   $('btnCopyInstall').addEventListener('click', async () => {
     if (!canCopy()) return;
     const ok = await copyText(installCommand(measuredForCommand()), $('cmdInstall'), $('copyInstallMsg'));
-    if (ok) markPending('software'); else showManual('manualSteps', $('cmdInstall'), true);
+    $('psBox').querySelector('.copy-hint').hidden = ok;
+    if (ok) markPending('software');
   });
   $('btnCopyUninstall').addEventListener('click', async () => {
     refreshUninstall();
     const ok = await copyText(uninstallCommand(restoreEpp()), $('cmdUninstall'), $('copyUninstallMsg'));
-    if (ok) markPending('software'); else showManual('unManual', $('cmdUninstall'), true);
+    $('psBox').querySelector('.copy-hint').hidden = ok;
+    if (ok) markPending('software');
   });
   $('btnPickPhys').addEventListener('click', () => { markPending('physical'); say($('physPickMsg'), 'physPicked'); });
   $('btnRemeasureWin').addEventListener('click', () => startRemeasure('software'));
@@ -823,7 +861,7 @@ function init() {
   if (window.ResizeObserver) new ResizeObserver(() => { if (!S.measuring) drawPad(); }).observe(pad);
   window.matchMedia('(prefers-color-scheme: dark)').addEventListener?.('change', () => { renderAll(); });
   // uninstall lives in the footer and never depends on a measurement
-  $('unRestoreEpp').addEventListener('change', refreshUninstall);
+  $('unRestoreEpp').addEventListener('change', () => { refreshUninstall(); renderSteps(); });
   refreshUninstall();
   renderAll();
 }

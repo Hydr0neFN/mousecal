@@ -5,9 +5,10 @@ A static website that measures how many degrees your mouse sensor is rotated and
 People swipe the mouse "horizontally" but the pointer drifts up or down by a few degrees. The page
 measures that angle in the browser (pointer lock, raw movement where available), then offers two fixes:
 
-- **Windows:** one copied command (Win+R, Ctrl+V, Ctrl+Shift+Enter) that installs
+- **Windows:** a small downloaded launcher (`mousecal-setup-<angle>.cmd`, built in the browser) that installs
   [Raw Accel](https://github.com/RawAccelOfficial/rawaccel) and sets its "Degrees of rotation".
-  Usually no reboot is needed.
+  Usually no reboot is needed. (The old "paste a command into Win+R" way is still there, collapsed under
+  Advanced, see "Why a downloaded launcher".)
 - **Mac / no install:** a diagram that shows how many degrees, and in which direction, to rotate the mouse body.
 
 Then it measures again and shows pass / fail (Windows path: |angle| <= 1 deg, physical path: <= 2 deg).
@@ -37,20 +38,24 @@ verifies the SHA256 before using it.
 | `app.js` | Pointer-lock measurement, live trail, result, re-measure, copy buttons. |
 | `analysis.js` | Pure functions (ES module, no DOM): stroke segmentation, statistics, `trimTail` / `analyzeTimed` (timed recordings), `verdict`, `isShaky`, CSV export helpers, `rawAccelSettings`. |
 | `store.js` | Pure helpers for the per-browser convenience record (`localStorage`: language, last result, path, pending flag). It is never used to compute a rotation. |
-| `commands.js` | The **one** place the page knows its own address (`SITE_BASE`) and the copied commands. |
+| `commands.js` | The **one** place the page knows its own address (`SITE_BASE`), the `.cmd` launcher text (`launcherCmd`) and the advanced PowerShell commands. |
 | `i18n.js` | All strings (zh-TW and English). |
 | `settings-template.js` | Generated: Raw Accel default settings, used by the "Advanced" section. |
+| `setup-hash.js` | Generated: `export const SETUP_SHA256 = '...'`, the SHA256 of the `setup.ps1` deployed with the page. |
 | `setup.ps1` | Generated, ASCII-only installer / uninstaller (see below). |
 | `_headers`, `.assetsignore` | Cloudflare static-assets config. |
 | `tools/setup.src.ps1` | **Source of truth** for `setup.ps1`. |
 | `tools/settings.template.json` | Raw Accel default `settings.json` (single source for the template). |
 | `tools/zip-files.txt` | SHA256 of every file in `RawAccel_v1.7.1.zip` (embedded into `setup.ps1`). |
-| `tools/build-setup.mjs` | Builds `setup.ps1` and `settings-template.js` from the two files above. |
-| `test/` | `analysis.test.mjs`, `store.test.mjs`, `site.test.mjs` (node, no dependencies) and `setup.test.ps1`. |
+| `tools/build-setup.mjs` | Builds `setup.ps1`, `settings-template.js` and `setup-hash.js` from the files above (`MOUSECAL_BUILD_OUT=<dir>` writes them elsewhere; the tests use that). |
+| `test/` | `analysis.test.mjs`, `store.test.mjs`, `site.test.mjs`, `launcher.test.mjs` (node, no dependencies) and `setup.test.ps1`. |
 
 `setup.ps1` is generated so that it stays pure ASCII: Chinese text becomes `\uXXXX` escapes that the script
-decodes at run time. That way it works however `irm` decodes the download (no charset header needed).
-After editing `tools/setup.src.ps1` or `tools/settings.template.json`, run `node tools/build-setup.mjs`.
+decodes at run time. That way it works however the download is decoded (no charset header needed).
+After editing `tools/setup.src.ps1` or `tools/settings.template.json`, run `node tools/build-setup.mjs`. It also
+writes `setup-hash.js`; **always deploy `setup.ps1` and `setup-hash.js` together** (the launcher the page builds
+refuses to run a `setup.ps1` whose SHA256 differs from `SETUP_SHA256`). `node --test test/*.mjs` fails when the
+committed generated files are stale.
 
 ## Deploy (Cloudflare Workers static assets)
 
@@ -74,12 +79,46 @@ Change the address in two places, then rebuild:
 1. `SITE_BASE` in `commands.js`
 2. `$SiteBase` near the top of `tools/setup.src.ps1`, then `node tools/build-setup.mjs`
 
-`node --test test/site.test.mjs` checks that both constants agree and the copied command fits the Win+R
+`node --test test/site.test.mjs` checks that both constants agree and the advanced PowerShell command fits the Win+R
 dialog (< 259 characters).
 
-## How setup.ps1 works
+## Why a downloaded launcher (and not "paste into Win+R")
 
-The copied command is:
+The first version told people to paste a PowerShell one-liner (`irm` + `[scriptblock]::Create`) into the Win+R dialog.
+That is exactly the "ClickFix" pattern real malware uses, so Microsoft Defender has detections for it
+(`Behavior:Win32/ClickFix`, `SuspClickFix`, "Suspicious command in RunMRU") and content blockers such as uBlock Origin
+block pages that do it. The main flow is now an ordinary file the user downloads and opens, which can be read in Notepad.
+It is not code signed (owner decision), so Windows SmartScreen shows "Windows protected your PC": the page tells the
+user to press "More info" then "Run anyway".
+
+## How the launcher and setup.ps1 work
+
+The main button builds the text of `mousecal-setup-<angle>.cmd` in the browser (`launcherCmd` in `commands.js`, Blob +
+`<a download>`; the uninstall button builds `mousecal-uninstall.cmd` and honours the "restore pointer precision"
+checkbox). The file is pure ASCII with CRLF line endings; Chinese messages are printed through PowerShell from `\uXXXX`
+escapes so no code page can garble them. It starts with a comment header (what it is, the measured angle, the source URL,
+this repository, the expected SHA256) and then:
+
+1. `net session >nul 2>&1 || (powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs" & exit /b)`
+   (asks for administrator rights, i.e. the UAC prompt, if it is not elevated yet).
+2. Makes `%ProgramData%\mousecal\dl-<random>` (the parent is refused if it is a link, owned by Administrators and locked with
+   `icacls ... /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F`), so nothing that is later run as
+   administrator sits in a folder a normal user can write to.
+3. Downloads `<SITE_BASE>/setup.ps1` there with `curl.exe -fsSL` (built into Windows 10 1803+), or with
+   `Invoke-WebRequest -UseBasicParsing -OutFile` when curl is missing.
+4. `certutil -hashfile ... SHA256`, compared case-insensitively (spaces stripped) with `SETUP_SHA256`, the hash baked
+   into the launcher from `setup-hash.js`. A mismatch prints a bilingual message
+   (「下載的檔案和網站上的版本不一致，已停止。請重新整理網頁再下載一次。」), runs nothing, and the folder is deleted.
+5. `powershell -NoProfile -ExecutionPolicy Bypass -File "<that file>" -Measured <deg> -NoPause`
+   (or `-Uninstall [-RestorePointerPrecision] -NoPause`).
+6. Deletes the folder and does one single `pause` (「按任意鍵關閉」); `-NoPause` stops setup.ps1 from pausing too.
+
+There is no `irm`, `iex`, `[scriptblock]::Create` or Win+R in this flow. The hash is also shown in small text under
+Advanced on the page. The hash proves the file equals the one deployed with the page; the trust root is still the site.
+
+**Advanced: PowerShell command.** For people who prefer a terminal there is a collapsed "Advanced: install with a
+PowerShell command" box with the old one-liner (copy only, never copied automatically) and a warning that some antivirus
+programs treat pasted commands as suspicious. The command is:
 
 ```
 powershell -NoProfile -ExecutionPolicy Bypass -Command "try{& ([scriptblock]::Create((irm https://<site>/setup.ps1))) -Measured 8.2}catch{$_;Read-Host 'Press Enter'}"
@@ -87,6 +126,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "try{& ([scriptblock]::Cr
 
 The `try/catch` keeps the Win+R window open with the error visible if the download itself fails; the script
 reports its own errors and waits for Enter by itself. The command stays under the 259 character Run-dialog limit.
+
+The one-click link (`mousecal://apply?m=...`, see below) is unchanged: the "Apply the fix" button opens it for people who
+already installed once; if nothing happens, a "No reaction? Download the installer" button appears after 3 seconds
+(nothing is downloaded automatically). The footer uninstall button works the same way.
 
 Parameters: `-Measured <deg>` (the angle the page measured), `-Rotation <deg>` (absolute value, manual use;
 exactly one of the two is required), `-Uninstall`, `-RestorePointerPrecision` (only with `-Uninstall`), `-DryRun`,
@@ -257,10 +300,13 @@ service key, and also waits for a key. That is why completion is detected by obs
 
 ## Security
 
-- The copied command runs the `setup.ps1` served by the site, so the site is the trust root, as with any
-  "paste this in a terminal" installer. Mitigations: HTTPS on the owner's domain, the script is open source on
-  GitHub, everything it downloads is pinned by SHA256 (the zip and each file inside it) or must carry a
-  Microsoft signature, and you can read it first (the link on the page) or run it with `-DryRun`.
+- The launcher runs the `setup.ps1` served by the site, so the site is the trust root, as with any installer.
+  Mitigations: HTTPS on the owner's domain, the script is open source on GitHub, the launcher checks the download
+  against the SHA256 of the `setup.ps1` deployed with the page (a half-deployed site or a swapped file is refused),
+  everything setup.ps1 downloads is pinned by SHA256 (the zip and each file inside it) or must carry a Microsoft
+  signature, and you can read both files first or run setup.ps1 with `-DryRun`. The launcher is not code signed.
+- The launcher downloads, verifies and runs setup.ps1 from an administrators-only folder under `%ProgramData%`, never
+  from `%TEMP%` or the Downloads folder, because it is already elevated when it does so.
 - Nothing is executed from a user-writable location while elevated: the zip is hashed in memory and staged in
   an administrators-only folder; the validator script and DLLs it loads live there or under Program Files.
 - Known limit (accepted): the setup mutex `Global\mousecal-setup` is a plain named mutex, so another local process
@@ -284,6 +330,8 @@ node --test test/*.mjs
 powershell -NoProfile -ExecutionPolicy Bypass -File test\setup.test.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File setup.ps1 -DryRun -NoPause -Measured 2.3
 ```
+
+`launcher.test.mjs` only looks at the generated launcher text (CRLF, ASCII, no `irm`/`iex`, hash, arguments, uninstall variant) and runs the build into a temp folder; no launcher is ever run by a test.
 
 Use the glob `node --test test/*.mjs` (a bare `node --test` or `test/` also picks up `setup.test.ps1`, which is not a
 node test). `analysis.test.mjs` recovers synthetic +5 / -3 / 0 degree swipes (with noise, 60 / 144 Hz event rates) within
@@ -316,7 +364,7 @@ MIT licensed, see `LICENSE`. By [Hydr0neFN](https://github.com/Hydr0neFN).
 橫向揮動滑鼠時，游標常常會往上或往下偏幾度。網頁在瀏覽器裡量出角度（使用指標鎖定，盡量取得未經加速的原始移動），
 然後提供兩種修正方式：
 
-- **Windows：** 複製一行指令（Win+R、Ctrl+V、Ctrl+Shift+Enter），安裝
+- **Windows：** 按「下載安裝程式」，下載 `mousecal-setup-<角度>.cmd`（網頁在瀏覽器裡產生的小文字檔），打開它，安裝
   [Raw Accel](https://github.com/RawAccelOfficial/rawaccel) 並設定「Degrees of rotation」。通常不需要重新開機。
 - **Mac／不想安裝：** 圖示會告訴你要把滑鼠本體轉幾度、往哪個方向轉。
 
@@ -324,10 +372,18 @@ MIT licensed, see `LICENSE`. By [Hydr0neFN](https://github.com/Hydr0neFN).
 
 **Raw Accel 並非由本專案散布。** `setup.ps1` 會從 Raw Accel 官方 GitHub 發行頁下載，並在使用前核對 SHA256。
 
-安裝指令會做的事（沒有隱藏的東西）：下載並驗證 Raw Accel v1.7.1、必要時安裝 Microsoft 的 VC++ 執行階段、
+**為什麼改成下載檔案：** 以前是請使用者把 PowerShell 指令貼進 Win+R，這跟惡意程式常用的「ClickFix」手法一樣，
+Microsoft Defender 有偵測（`Behavior:Win32/ClickFix`、`SuspClickFix`、「Suspicious command in RunMRU」），擋廣告的外掛也會擋。
+現在的主要流程是下載 `.cmd` 檔再打開（用記事本就看得到每一行）：它先要求系統管理員權限，在
+`%ProgramData%\mousecal\dl-<亂數>`（只有系統管理員能寫入）下載 `setup.ps1`，用 `certutil` 核對 SHA256 是否等於網頁
+（`setup-hash.js`，「進階」裡也看得到）的值，不同就停止，相同才執行，最後刪掉資料夾。檔案沒有程式碼簽章，所以 Windows 會顯示
+「Windows 已保護您的電腦」，請按「其他資訊」→「仍要執行」。舊的 Win+R 指令還在「進階：用 PowerShell 指令安裝」裡（預設收起來，
+並提醒有些防毒軟體會覺得可疑）。
+
+安裝程式會做的事（沒有隱藏的東西）：下載並驗證 Raw Accel v1.7.1、必要時安裝 Microsoft 的 VC++ 執行階段、
 安裝到 `C:\Program Files\RawAccel\` 並安裝它的驅動程式、寫入只含旋轉角度的 `settings.json`（既有檔案會先備份）、
 新增登入工作排程 `RawAccel Apply Settings`。有遊戲或反作弊程式在執行時會拒絕執行。不蒐集任何資料。
-解除安裝用同樣方式執行帶 `-Uninstall` 的指令。
+解除安裝：頁尾的「下載解除安裝程式」會下載 `mousecal-uninstall.cmd`（會依勾選框決定要不要加 `-RestorePointerPrecision`），打開方式相同。
 
 **先量再修（關掉「增強指標的精確度」）：** 安裝時會把 Windows 的「增強指標的精確度」（滑鼠加速）關掉，這樣不讀原始輸入、
 只看游標的遊戲也不會有加速。原本的三個值（`HKCU\Control Panel\Mouse` 的 `MouseSpeed`、`MouseThreshold1`、
@@ -338,8 +394,8 @@ MIT licensed, see `LICENSE`. By [Hydr0neFN](https://github.com/Hydr0neFN).
 
 **一鍵連結（`mousecal://`）：** 第一次安裝之後，安裝程式還會註冊 `mousecal://` 網址通訊協定（登錄在
 `HKLM\SOFTWARE\Classes\mousecal`，檔案 `handler.vbs`、`handler.ps1` 和一份 `setup.ps1` 副本放在
-`C:\Program Files\RawAccel\mousecal\`，只有系統管理員能修改）。之後重新量測，網頁上的「一鍵套用（已經安裝過）」
-（`mousecal://apply?m=<角度>`）和「一鍵解除安裝」（`mousecal://uninstall`）就不用再複製指令。安全限制：每次都會先跳出
+`C:\Program Files\RawAccel\mousecal\`，只有系統管理員能修改）。之後重新量測，網頁上的「套用修正」
+（`mousecal://apply?m=<角度>`）和頁尾的「解除安裝」（`mousecal://uninstall`）就不用再下載檔案；沒有反應時，3 秒後會出現「沒有反應？下載安裝程式」按鈕（不會自動下載）。安全限制：每次都會先跳出
 確認視窗（預設「否」）再跳 UAC；只接受這兩種動作；連結只能含 `[A-Za-z0-9:/?=.&-]` 且不超過 64 字元，量測值
 |m| <= 20，套用後的旋轉不得超過 ±45°；有遊戲在執行時拒絕；提升權限後只會執行資料夾裡那份本機的 `setup.ps1`。
 解除安裝時會一併移除這些檔案和登錄機碼（記錄檔 `%LOCALAPPDATA%\mousecal\handler.log` 只含數值，放在各使用者自己的資料夾，可自行刪除）。

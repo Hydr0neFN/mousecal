@@ -146,16 +146,14 @@ test('one-click links have exactly the shapes the handler accepts', () => {
   for (const bad of [20.05, -20.06, 21, 45, NaN, Infinity]) assert.throws(() => applyUrl(bad));
 });
 
-test('page wiring: one-click apply + uninstall buttons, first-install flow kept, blur fallback', () => {
+test('page wiring: one-click apply + uninstall buttons, download fallback, no blur branching', () => {
   const html = read('index.html'), app = read('app.js');
-  for (const id of ['btnApply', 'oneClickMsg', 'ocUrl', 'btnOneClickUn', 'oneClickUnMsg', 'unUrl', 'btnCopyInstall', 'btnCopyUninstall', 'cmdInstall', 'cmdUninstall', 'manualSteps', 'unManual', 'remeasureBar', 'welcome']) {
+  for (const id of ['btnApply', 'oneClickMsg', 'ocUrl', 'btnOneClickUn', 'oneClickUnMsg', 'unUrl', 'btnCopyInstall', 'btnCopyUninstall', 'cmdInstall', 'cmdUninstall', 'manualSteps', 'unManual', 'remeasureBar', 'welcome', 'btnDownload', 'btnFallbackDownload']) {
     assert.ok(html.includes(`id="${id}"`), id);
   }
   assert.ok(/applyUrl\(/.test(app) && /uninstallUrl\(/.test(app));
-  // one primary button: copy first, then open the link; nothing branches on blur / visibility
+  // the link is opened without branching on blur / visibility; the download is only offered after 3 s (see launcher.test.mjs)
   assert.ok(!/addEventListener\('blur'|visibilitychange|document\.hidden/.test(app), 'must not branch on blur');
-  const run = /function runLinkAction[\s\S]*?\n\}/.exec(app)[0];
-  assert.ok(run.indexOf('copyQuiet(') > 0 && run.indexOf('copyQuiet(') < run.indexOf('window.location.assign'), 'copy must come before the link');
   assert.ok(/FALLBACK_DELAY_MS = 3000/.test(app));
   assert.ok(STRINGS.zh.btnApply === '套用修正' && STRINGS.zh.btnOneClickUn === '解除安裝');
   assert.ok(!html.includes('id="btnOneClick"') && !('firstTitle' in STRINGS.zh), 'separate first-install / one-click buttons are gone');
@@ -195,7 +193,7 @@ test('README: node test glob, VBScript deprecation + copy-command fallback, per-
   assert.ok(!r.includes('node --test test/analysis.test.mjs test/site.test.mjs'), 'old explicit test list still there');
   assert.match(r, /VBScript[\s\S]{0,200}deprecated/);
   assert.match(r, /copy-command method[\s\S]{0,200}neither the handler nor VBScript/);
-  assert.ok(r.includes('%LOCALAPPDATA%\\mousecal\\handler.log') && !r.includes('%ProgramData%\\mousecal'), 'handler log location');
+  assert.ok(r.includes('%LOCALAPPDATA%\\mousecal\\handler.log') && !r.includes('%ProgramData%\\mousecal\\handler.log'), 'handler log location');
   assert.ok(r.includes('Global\\mousecal-setup') && r.includes('.staging\\<guid>'), 'mutex / staging notes');
 });
 
@@ -240,7 +238,7 @@ test('no pass / fail verdict wording; positive "already fixed" only; number sits
   }
   for (const [k, v] of Object.entries(STRINGS.zh)) assert.ok(!/過關|通過|還沒過|沒有藏東西|合格/.test(v), `zh.${k}: ${v}`);
   for (const [k, v] of Object.entries(STRINGS.en)) assert.ok(!/\bpass\b|\bPass!|Not yet|nothing hidden/i.test(v), `en.${k}: ${v}`);
-  assert.equal(STRINGS.zh.discTitle, '這個指令會做什麼');
+  assert.equal(STRINGS.zh.discTitle, '這個安裝程式會做什麼');
   assert.equal(STRINGS.zh.goodNow, '已經修好了 ✓');
   assert.equal(STRINGS.zh.applyAmount, '會修正 {r}°');
   assert.equal(STRINGS.zh.applyAmountAgain, '會再補上 {r}°');
@@ -298,7 +296,7 @@ test('footer checkbox (checked by default) feeds the uninstall button and the co
   assert.ok(/Enhance pointer precision/.test(STRINGS.en.disc9));
   assert.ok(html.includes('data-i18n="disc9"'));
   assert.ok(/uninstallUrl\(restoreEpp\(\)\)/.test(app) && /uninstallCommand\(restoreEpp\(\)\)/.test(app), 'the one-click button and the copied command both follow the checkbox');
-  assert.ok(/'change', refreshUninstall/.test(app));
+  assert.ok(/'change', \(\) => \{ refreshUninstall\(\)/.test(app));
 });
 
 test('copy that fails or is blocked is never reported as copied; the command is shown pre-selected with a Ctrl+C hint', async () => {
@@ -323,16 +321,10 @@ test('copy that fails or is blocked is never reported as copied; the command is 
   // the "copied" message is tied to the real outcome
   assert.ok(/say\(msgEl, ok \? 'copied' : 'copySelected'\)/.test(app) && /await copyQuiet\(/.test(app));
   const html = read('index.html');
-  assert.equal((html.match(/class="small-note copy-hint" hidden data-i18n="copyHint"/g) || []).length, 2, 'a hint above both command boxes');
+  assert.equal((html.match(/class="small-note copy-hint" hidden data-i18n="copyHint"/g) || []).length, 1, 'a hint above the (advanced) command boxes');
   assert.equal(STRINGS.zh.copyHint, '請按 Ctrl+C 複製');
-  const sm = /function showManual[\s\S]*?\n\}\n/.exec(app)[0];
-  assert.ok(/\.copy-hint/.test(sm) && /data-i18n-ok/.test(sm) && /selectNode\(node\)/.test(sm));
-  for (const k of ['manualTitleNoCopy', 'unHowNoCopy']) {
-    assert.ok(STRINGS.zh[k] && STRINGS.en[k], k);
-    assert.ok(!/已經複製好了|already copied/.test(STRINGS.zh[k] + STRINGS.en[k]), k + ' must not claim it was copied');
-  }
-  assert.ok(html.includes('data-i18n-fail="manualTitleNoCopy"') && html.includes('data-i18n-fail="unHowNoCopy"'));
-  // the notes that used to promise a copy now say "tries"
+  assert.ok(/\$\('psBox'\)\.querySelector\('\.copy-hint'\)\.hidden = ok/.test(app), 'the hint follows the real copy outcome');
+  // the notes no longer promise a copy
   assert.ok(!/複製好|同時複製好/.test(STRINGS.zh.ocNote + STRINGS.zh.unOneNote) && !/is copied at the same moment/.test(STRINGS.en.ocNote + STRINGS.en.unOneNote));
 });
 

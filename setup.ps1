@@ -4,7 +4,10 @@
   tools/build-setup.mjs (ASCII only -- Chinese text becomes \uXXXX escapes -- so it
   survives any download encoding).
 
-  The website copies this one-liner (Win+R, Ctrl+V, Ctrl+Shift+Enter = run as administrator):
+  The website's main button downloads a small launcher (mousecal-setup-<deg>.cmd, generated in the browser). It elevates
+  itself, downloads this file into an administrators-only folder, checks its SHA256 against the value the page shows,
+  runs it with -File and deletes the folder. For people who prefer a terminal, the "Advanced" section of the page
+  still offers this one-liner (Win+R, Ctrl+V, Ctrl+Shift+Enter = run as administrator):
     powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm <SITE>/setup.ps1))) -Measured 8.2"
   -Measured <deg>   the angle the website just measured. The script ADDS it to the rotation Raw Accel
                     is currently applying (read from the driver), or uses it as is if no driver runs.
@@ -1629,7 +1632,7 @@ function Get-ErrorHint([int]$Code, [bool]$ForUninstall = $false) {
     }
     switch ($Code) {
         2 { return @('Close this window, then press Win+R, paste the command, and press Ctrl+Shift+Enter (not just Enter).', '\u95dc\u9589\u9019\u500b\u8996\u7a97\uff0c\u518d\u6309 Win+R\u3001\u8cbc\u4e0a\u6307\u4ee4\u3001\u6309 Ctrl+Shift+Enter\uff08\u4e0d\u662f\u53ea\u6309 Enter\uff09\u3002') }
-        3 { return @('Go back to the website and press "Copy install command" again.', '\u56de\u5230\u7db2\u7ad9\uff0c\u518d\u6309\u4e00\u6b21\u300c\u8907\u88fd\u5b89\u88dd\u6307\u4ee4\u300d\u3002') }
+        3 { return @('Go back to the website and download the installer again.', '\u56de\u5230\u7db2\u7ad9\uff0c\u518d\u4e0b\u8f09\u4e00\u6b21\u5b89\u88dd\u7a0b\u5f0f\u3002') }
         4 { return @('The download was not the official file, so nothing was installed. Try again later; if it keeps happening, do not use this tool.', '\u4e0b\u8f09\u5230\u7684\u4e0d\u662f\u5b98\u65b9\u6a94\u6848\uff0c\u6240\u4ee5\u4ec0\u9ebc\u90fd\u6c92\u6709\u5b89\u88dd\u3002\u8acb\u7a0d\u5f8c\u518d\u8a66\uff1b\u5982\u679c\u4e00\u76f4\u9019\u6a23\uff0c\u8acb\u4e0d\u8981\u4f7f\u7528\u9019\u500b\u5de5\u5177\u3002') }
         5 { return @('A file failed its Microsoft signature check, so nothing was installed. Try again later.', '\u6709\u6a94\u6848\u7684 Microsoft \u7c3d\u7ae0\u6aa2\u67e5\u6c92\u901a\u904e\uff0c\u6240\u4ee5\u4ec0\u9ebc\u90fd\u6c92\u6709\u5b89\u88dd\u3002\u8acb\u7a0d\u5f8c\u518d\u8a66\u3002') }
         6 { return @('Close the game (and its launcher / anti-cheat client), then run the command again.', '\u95dc\u9589\u904a\u6232\uff08\u548c\u5b83\u7684\u555f\u52d5\u5668\u3001\u53cd\u4f5c\u5f0a\u7a0b\u5f0f\uff09\uff0c\u518d\u57f7\u884c\u4e00\u6b21\u6307\u4ee4\u3002') }

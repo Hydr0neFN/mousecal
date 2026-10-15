@@ -134,54 +134,63 @@
           <p class="path-sub" data-i18n="winSub"></p>
         </header>
 
+        <div class="firsttime" id="firstTime">
+          <button id="btnDownload" class="btn big accent" type="button" data-i18n="btnDownload"></button>
+          <p class="small-note" data-i18n="dlNote"></p>
+          <p id="dlMsg" class="copy-msg" role="status" aria-live="polite"></p>
+        </div>
+
+        <div id="manualSteps" class="manual" hidden>
+          <h3 data-i18n="manualTitle"></h3>
+          <ol class="big-steps">
+            <li>
+              <div class="step-body">
+                <p class="step-title" id="dlStep1"></p>
+                <p class="small-note" data-i18n="dl1note"></p>
+              </div>
+            </li>
+            <li>
+              <div class="step-body">
+                <p class="step-title" data-i18n="dl2"></p>
+                <p class="small-note" data-i18n="dl2note"></p>
+              </div>
+            </li>
+            <li>
+              <div class="step-body">
+                <p class="step-title" data-i18n="dl3"></p>
+                <p class="small-note" data-i18n="dl3note"></p>
+              </div>
+            </li>
+            <li>
+              <div class="step-body">
+                <p class="step-title" data-i18n="dl4"></p>
+                <button id="btnRemeasureWin" class="btn big accent" type="button" data-i18n="btnRemeasure"></button>
+              </div>
+            </li>
+          </ol>
+        </div>
+
         <div class="oneclick" id="oneClick">
+          <p class="oneclick-title" data-i18n="ocTitle"></p>
           <p id="goodWin" class="good" hidden data-i18n="goodNow"></p>
           <button id="btnApply" class="btn big accent" type="button" data-i18n="btnApply"></button>
           <p id="applyAmount" class="small-note apply-amount"></p>
           <p id="oneClickMsg" class="copy-msg" role="status" aria-live="polite"></p>
+          <div id="fallbackBox" class="fallback" hidden>
+            <button id="btnFallbackDownload" class="btn small" type="button" data-i18n="btnFallbackDownload"></button>
+          </div>
           <p id="ocState" class="small-note"></p>
           <p class="small-note" data-i18n="ocNote"></p>
           <p class="small-note" data-i18n="ocUrlLabel"></p>
           <pre id="ocUrl" class="cmd small-cmd" tabindex="0"></pre>
         </div>
 
-        <div id="manualSteps" class="manual" hidden>
-          <h3 data-i18n="manualTitle" data-i18n-ok="manualTitle" data-i18n-fail="manualTitleNoCopy"></h3>
-          <ol class="big-steps">
-            <li>
-              <div class="step-body">
-                <p class="step-title" data-i18n="w2"></p>
-                <p class="keys" aria-label="Win+R, Ctrl+V, Ctrl+Shift+Enter">
-                  <span class="keygroup"><kbd>Win</kbd><i>+</i><kbd>R</kbd></span>
-                  <i class="arrow" aria-hidden="true">&rarr;</i>
-                  <span class="keygroup"><kbd>Ctrl</kbd><i>+</i><kbd>V</kbd></span>
-                  <i class="arrow" aria-hidden="true">&rarr;</i>
-                  <span class="keygroup"><kbd>Ctrl</kbd><i>+</i><kbd>Shift</kbd><i>+</i><kbd>Enter</kbd></span>
-                </p>
-                <p class="small-note" data-i18n="w2note"></p>
-              </div>
-            </li>
-            <li>
-              <div class="step-body">
-                <p class="step-title" data-i18n-html="w3"></p>
-                <p class="small-note" data-i18n="w3note"></p>
-              </div>
-            </li>
-            <li>
-              <div class="step-body">
-                <p class="step-title" data-i18n="w4"></p>
-                <button id="btnRemeasureWin" class="btn big accent" type="button" data-i18n="btnRemeasure"></button>
-              </div>
-            </li>
-          </ol>
-          <p id="cmdNote" class="small-note"></p>
-          <p class="small-note copy-hint" hidden data-i18n="copyHint"></p>
-          <pre id="cmdInstall" class="cmd" tabindex="0"></pre>
-        </div>
-
         <section class="disclose" aria-labelledby="h-disc">
           <h3 id="h-disc" data-i18n="discTitle"></h3>
           <ul>
+            <li data-i18n="discL1"></li>
+            <li data-i18n="discL2"></li>
+            <li data-i18n="discL3"></li>
             <li data-i18n-html="disc1"></li>
             <li data-i18n="disc2"></li>
             <li data-i18n="disc3"></li>
@@ -249,13 +258,22 @@
           <button id="btnDownloadJson" class="btn small ghost" type="button" data-i18n="btnDownloadJson"></button>
           <span id="copyJsonMsg" class="copy-msg inline" role="status" aria-live="polite"></span>
         </div>
-        <p class="small-note" data-i18n="advCopyOnly"></p>
-        <div class="adv-actions">
-          <button id="btnCopyInstall" class="btn small ghost" type="button" data-i18n="btnCopyInstall"></button>
-          <span id="copyInstallMsg" class="copy-msg inline" role="status" aria-live="polite"></span>
-          <button id="btnCopyUninstall" class="btn small ghost" type="button" data-i18n="btnCopyUninstall"></button>
-          <span id="copyUninstallMsg" class="copy-msg inline" role="status" aria-live="polite"></span>
-        </div>
+        <p class="small-note adv-hash"><span data-i18n="advHashLabel"></span> <code id="setupHash"></code></p>
+        <details class="adv-ps" id="psBox">
+          <summary data-i18n="psTitle"></summary>
+          <p class="notice warn" data-i18n="psWarn"></p>
+          <p class="small-note" data-i18n="psHow"></p>
+          <div class="adv-actions">
+            <button id="btnCopyInstall" class="btn small ghost" type="button" data-i18n="btnCopyInstall"></button>
+            <span id="copyInstallMsg" class="copy-msg inline" role="status" aria-live="polite"></span>
+            <button id="btnCopyUninstall" class="btn small ghost" type="button" data-i18n="btnCopyUninstall"></button>
+            <span id="copyUninstallMsg" class="copy-msg inline" role="status" aria-live="polite"></span>
+          </div>
+          <p id="cmdNote" class="small-note"></p>
+          <p class="small-note copy-hint" hidden data-i18n="copyHint"></p>
+          <pre id="cmdInstall" class="cmd small-cmd" tabindex="0"></pre>
+          <pre id="cmdUninstall" class="cmd small-cmd" tabindex="0"></pre>
+        </details>
         <textarea id="jsonOut" class="json-out" readonly rows="8" spellcheck="false" aria-label="settings.json"></textarea>
       </div>
     </details>
@@ -272,14 +290,24 @@
   <section class="uninstall" aria-labelledby="h-un">
     <h3 id="h-un" data-i18n="unTitle"></h3>
     <label class="check"><input type="checkbox" id="unRestoreEpp" checked> <span data-i18n="unRestoreEpp"></span></label>
-    <button id="btnOneClickUn" class="btn small ghost" type="button" data-i18n="btnOneClickUn"></button>
-    <span id="oneClickUnMsg" class="copy-msg inline" role="status" aria-live="polite"></span>
+    <div class="adv-actions">
+      <button id="btnDownloadUn" class="btn small ghost" type="button" data-i18n="btnDownloadUn"></button>
+      <button id="btnOneClickUn" class="btn small ghost" type="button" data-i18n="btnOneClickUn"></button>
+      <span id="oneClickUnMsg" class="copy-msg inline" role="status" aria-live="polite"></span>
+    </div>
+    <div id="unFallbackBox" class="fallback" hidden>
+      <button id="btnUnFallbackDownload" class="btn small" type="button" data-i18n="btnUnFallbackDownload"></button>
+    </div>
     <p class="small-note" data-i18n="unOneNote"></p>
     <p class="small-note" hidden><code id="unUrl"></code></p>
-    <div id="unManual" hidden>
-      <p class="small-note" data-i18n="unHow" data-i18n-ok="unHow" data-i18n-fail="unHowNoCopy"></p>
-      <p class="small-note copy-hint" hidden data-i18n="copyHint"></p>
-      <pre id="cmdUninstall" class="cmd small-cmd" tabindex="0"></pre>
+    <div id="unManual" class="manual compact" hidden>
+      <p class="small-note" data-i18n="unHow"></p>
+      <ol class="big-steps">
+        <li><div class="step-body"><p class="step-title" id="unStep1"></p></div></li>
+        <li><div class="step-body"><p class="step-title" data-i18n="dl2"></p></div></li>
+        <li><div class="step-body"><p class="step-title" data-i18n="dl3"></p></div></li>
+        <li><div class="step-body"><p class="step-title" data-i18n="unS4"></p></div></li>
+      </ol>
     </div>
   </section>
   <p data-i18n="footPrivacy"></p>

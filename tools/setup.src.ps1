@@ -4,7 +4,10 @@
   tools/build-setup.mjs (ASCII only -- Chinese text becomes \uXXXX escapes -- so it
   survives any download encoding).
 
-  The website copies this one-liner (Win+R, Ctrl+V, Ctrl+Shift+Enter = run as administrator):
+  The website's main button downloads a small launcher (mousecal-setup-<deg>.cmd, generated in the browser). It elevates
+  itself, downloads this file into an administrators-only folder, checks its SHA256 against the value the page shows,
+  runs it with -File and deletes the folder. For people who prefer a terminal, the "Advanced" section of the page
+  still offers this one-liner (Win+R, Ctrl+V, Ctrl+Shift+Enter = run as administrator):
     powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm <SITE>/setup.ps1))) -Measured 8.2"
   -Measured <deg>   the angle the website just measured. The script ADDS it to the rotation Raw Accel
                     is currently applying (read from the driver), or uses it as is if no driver runs.
@@ -1524,7 +1527,7 @@ function Get-ErrorHint([int]$Code, [bool]$ForUninstall = $false) {
     }
     switch ($Code) {
         2 { return @('Close this window, then press Win+R, paste the command, and press Ctrl+Shift+Enter (not just Enter).', '關閉這個視窗，再按 Win+R、貼上指令、按 Ctrl+Shift+Enter（不是只按 Enter）。') }
-        3 { return @('Go back to the website and press "Copy install command" again.', '回到網站，再按一次「複製安裝指令」。') }
+        3 { return @('Go back to the website and download the installer again.', '回到網站，再下載一次安裝程式。') }
         4 { return @('The download was not the official file, so nothing was installed. Try again later; if it keeps happening, do not use this tool.', '下載到的不是官方檔案，所以什麼都沒有安裝。請稍後再試；如果一直這樣，請不要使用這個工具。') }
         5 { return @('A file failed its Microsoft signature check, so nothing was installed. Try again later.', '有檔案的 Microsoft 簽章檢查沒通過，所以什麼都沒有安裝。請稍後再試。') }
         6 { return @('Close the game (and its launcher / anti-cheat client), then run the command again.', '關閉遊戲（和它的啟動器、反作弊程式），再執行一次指令。') }

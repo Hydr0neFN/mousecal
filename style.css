@@ -328,3 +328,11 @@ body.has-bar { padding-bottom: calc(96px + env(safe-area-inset-bottom)); }
 .manual.compact { font-size: 14px; }
 .manual.compact .step-title { font-size: 15px; }
 .manual.compact .btn.big { font-size: 16px; padding: 10px 16px; }
+
+/* ---- downloaded installer: first-time block, fallback button, advanced PowerShell box ---- */
+.firsttime { margin: 0 0 22px; }
+.oneclick-title { margin: 0 0 8px; font: 700 17px/1.4 var(--font-sans); }
+.fallback { margin: 10px 0 0; }
+.adv-hash code { font: 400 12px/1.5 var(--font-mono); word-break: break-all; overflow-wrap: anywhere; user-select: all; }
+.adv-ps { margin: 14px 0 0; }
+.adv-ps summary { cursor: pointer; font-weight: 700; }
