@@ -55,10 +55,13 @@ export function uninstallUrl(restore = false) {
 // The downloaded launcher: the page builds the text of a small .cmd file in the browser (Blob + <a download>); the
 // user opens it. It is plain text on purpose (readable in Notepad), pure ASCII (Chinese messages are printed through
 // PowerShell from \uXXXX escapes, so no code page can garble them) and uses CRLF line endings.
-// Flow: self-elevate -> admin-only folder under %ProgramData% -> download setup.ps1 -> check SHA256 against
-// SETUP_SHA256 (generated together with setup.ps1) -> run it with -File -> delete the folder -> one pause.
+// Flow: check for admin rights with fltmc (relaunch itself elevated at most once, marked by an argument) -> ONE
+// elevated PowerShell -Command line that makes a brand-new random folder under %ProgramData% (ACL set at creation),
+// downloads setup.ps1 into it, checks its SHA256 against SETUP_SHA256 (generated together with setup.ps1), runs it
+// with -File, deletes the folder and pauses. All logic is in that one line, so cmd has nothing left to re-read.
 // Nothing is piped into an interpreter: no irm, no iex, no scriptblock::Create, no Win+R.
 export const REPO_URL = 'https://github.com/Hydr0neFN/mousecal';
+export const LAUNCHER_MARKER = 'mousecal-elevated';
 
 const toEscapes = (s) => s.replace(/[^\x20-\x7e]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
 
@@ -68,6 +71,8 @@ export const LAUNCHER_ZH = {
   noDir: '無法建立安全的暫存資料夾，沒有做任何變更。',
   noDownload: '下載失敗，請檢查網路後再試一次。沒有做任何變更。',
   mismatch: '下載的檔案和網站上的版本不一致，已停止。請重新整理網頁再下載一次。',
+  declined: '沒有取得系統管理員權限（可能按了「否」）。沒有做任何變更。',
+  noAdmin: '仍然沒有系統管理員權限，已停止。沒有做任何變更。',
   close: '按任意鍵關閉'
 };
 const LAUNCHER_EN = {
@@ -75,6 +80,8 @@ const LAUNCHER_EN = {
   noDir: 'Could not create a safe temporary folder. Nothing was changed.',
   noDownload: 'The download failed. Check your internet connection and try again. Nothing was changed.',
   mismatch: 'The downloaded file does not match the version on the website. Stopped. Reload the web page and download the launcher again.',
+  declined: 'Administrator permission was not granted (or the Windows prompt could not be shown). Nothing was changed.',
+  noAdmin: 'Still no administrator rights, so it stopped. Nothing was changed.',
   close: 'Press any key to close.'
 };
 
@@ -104,10 +111,48 @@ export function launcherCmd({ measured, restoreEpp = false, mode = 'install', ba
     actionLine = 'rem Action               : remove what mousecal installed' + (restoreEpp === true ? ', and put Windows "Enhance pointer precision" back' : '');
   }
   const url = base + '/setup.ps1';
+  const PS = '%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
   const zh = (key) => 'call :zh "' + toEscapes(LAUNCHER_ZH[key]) + '"';
   const en = (key) => 'echo ' + LAUNCHER_EN[key];
   const both = (key) => [en(key), zh(key)];
-  const ACL = '/inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F';
+  // The PowerShell block lives inside cmd's double quotes: it may not contain " or % (cmd would change them) and uses
+  // only single-quoted strings. Messages are 'English' 'zh as \uXXXX' pairs printed by the helper function m.
+  const m = (key) => "m '" + LAUNCHER_EN[key] + "' '" + toEscapes(LAUNCHER_ZH[key]) + "';";
+  const psExe = "($env:SystemRoot+'\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')";
+  const block = [
+    "$ErrorActionPreference='Stop';",
+    'function m($e,$z){Write-Host $e;Write-Host ([regex]::Unescape($z))}',
+    // delete a tree without ever following a link: a reparse point (1024) is removed itself, never entered
+    'function d($x){$t=[IO.File]::GetAttributes($x);if(($t -band 16) -and -not ($t -band 1024)){foreach($c in [IO.Directory]::GetFileSystemEntries($x)){d $c}};if($t -band 16){[IO.Directory]::Delete($x)}else{[IO.File]::Delete($x)}}',
+    '$rc=1;$k=1;$mine=$false;$p=$null;',
+    m('working'),
+    'try{',
+    '[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;',
+    "$adm=New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544');",
+    "$sys=New-Object Security.Principal.SecurityIdentifier('S-1-5-18');",
+    '$sec=New-Object Security.AccessControl.DirectorySecurity;',
+    '$sec.SetAccessRuleProtection($true,$false);',
+    '$sec.SetOwner($adm);',
+    "foreach($s in $adm,$sys){$sec.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($s,'FullControl','ContainerInherit,ObjectInherit','None','Allow')))};",
+    "$p=Join-Path $env:ProgramData ('mousecal-dl-'+[guid]::NewGuid().ToString('N'));",
+    '$ex=$true;try{$null=[IO.File]::GetAttributes($p)}catch{$ex=$false};',
+    "if($ex){throw 'the folder already exists'};",
+    '$null=[IO.Directory]::CreateDirectory($p,$sec);$mine=$true;',
+    "if([IO.File]::GetAttributes($p) -band 1024){throw 'the folder is a link'};",
+    "if(-not [IO.Directory]::GetAccessControl($p).AreAccessRulesProtected){throw 'the folder is not locked'};",
+    "$f=Join-Path $p 'setup.ps1';$k=2;",
+    '$w=New-Object Net.WebClient;$w.Proxy=[Net.WebRequest]::GetSystemWebProxy();$w.Proxy.Credentials=[Net.CredentialCache]::DefaultCredentials;',
+    '$w.DownloadFile($env:MC_URL,$f);$w.Dispose();$k=3;',
+    "$s=[IO.File]::OpenRead($f);try{$g=[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($s)).Replace('-','').ToLower()}finally{$s.Dispose()};",
+    'if($g -ne $env:MC_SHA256){$rc=4;' + m('mismatch').slice(0, -1) + '}else{$k=4;Write-Host \'\';' +
+      '& ' + psExe + ' -NoProfile -ExecutionPolicy Bypass -File $f ' + args + ';$rc=[int]$LASTEXITCODE}',
+    '}catch{if($k -eq 1){' + m('noDir') + '}elseif($k -le 3){' + m('noDownload') + '}else{Write-Host $_.Exception.Message}}',
+    "finally{if($mine){try{d $p}catch{Write-Host ('Could not delete '+$p)}}};",
+    "Write-Host '';" + m('close'),
+    'try{[void][Console]::ReadKey($true)}catch{};exit $rc'
+  ].join('');
+  if (/["%\r\n]/.test(block)) throw new Error('bad character in the PowerShell block');
+  if (block.length > 7000) throw new Error('PowerShell block too long for one cmd line');
 
   const lines = [
     '@echo off',
@@ -119,85 +164,43 @@ export function launcherCmd({ measured, restoreEpp = false, mode = 'install', ba
     'rem Expected SHA256    : ' + hash + ' (also shown in the Advanced section of the page)',
     'rem Project (open source): ' + REPO_URL,
     'rem What it does:',
-    'rem   1. asks for administrator rights (the Windows UAC window)',
-    'rem   2. makes a folder only administrators can write to, under ProgramData',
+    'rem   1. asks for administrator rights (the Windows UAC window), once',
+    'rem   2. makes a brand-new folder under ProgramData that only administrators can use',
     'rem   3. downloads setup.ps1 from the address above into that folder',
     'rem   4. checks the SHA256 of the download; if it differs it stops and runs nothing',
     'rem   5. runs setup.ps1 (it installs or removes Raw Accel, a mouse driver)',
     'rem   6. deletes the folder again',
+    'rem Steps 2-6 are the one long PowerShell line below.',
     'rem ======================================================================================',
-    'setlocal EnableExtensions',
-    // first, so nothing below can pick up a program from the folder this file was saved in
+    'setlocal EnableExtensions DisableDelayedExpansion',
+    'set "MC_SELF=%~f0"',
+    // before anything else runs: nothing below can pick up a program from the folder this file was saved in
     'cd /d "%SystemRoot%\\System32"',
-    'net session >nul 2>&1 || (powershell -NoProfile -Command "Start-Process -FilePath \'%~f0\' -Verb RunAs" & exit /b)',
+    '"%SystemRoot%\\System32\\fltmc.exe" >nul 2>&1 || goto :elevate',
     'set "MC_URL=' + url + '"',
     'set "MC_SHA256=' + hash + '"',
-    'set "MC_ROOT=%ProgramData%\\mousecal"',
-    'set "MC_DIR=%MC_ROOT%\\dl-%RANDOM%%RANDOM%%RANDOM%"',
-    'set "MC_PS1=%MC_DIR%\\setup.ps1"',
-    'set "MC_MADE="',
-    'set "MC_RC=1"',
+    '"' + PS + '" -NoProfile -Command "' + block + '" & exit /b',
+    '',
+    ':elevate',
+    'if /i "%~1"=="' + LAUNCHER_MARKER + '" goto :noadmin',
+    '"' + PS + '" -NoProfile -Command "try{Start-Process -FilePath $env:MC_SELF -ArgumentList \'' + LAUNCHER_MARKER + '\' -Verb RunAs -ErrorAction Stop}catch{exit 1}" && exit /b 0',
     'echo.',
-    'echo ' + LAUNCHER_EN.working,
-    zh('working'),
+    ...both('declined'),
+    'goto :end',
     '',
-    'rem --- an administrators-only working folder (a pre-made link is refused)',
-    'if exist "%MC_ROOT%" fsutil reparsepoint query "%MC_ROOT%" >nul 2>&1 && goto :fail_dir',
-    'if not exist "%MC_ROOT%" mkdir "%MC_ROOT%" >nul 2>&1',
-    'if not exist "%MC_ROOT%" goto :fail_dir',
-    'icacls "%MC_ROOT%" /setowner *S-1-5-32-544 >nul 2>&1 || goto :fail_dir',
-    'icacls "%MC_ROOT%" ' + ACL + ' >nul 2>&1 || goto :fail_dir',
-    'if exist "%MC_DIR%" goto :fail_dir',
-    'mkdir "%MC_DIR%" >nul 2>&1 || goto :fail_dir',
-    'set "MC_MADE=1"',
-    'icacls "%MC_DIR%" ' + ACL + ' >nul 2>&1 || goto :fail_dir',
-    '',
-    'rem --- download (curl.exe is built into Windows 10 1803 and later; otherwise PowerShell)',
-    'set "MC_OK="',
-    'where curl.exe >nul 2>&1 && curl.exe -fsSL -o "%MC_PS1%" "%MC_URL%" && set "MC_OK=1"',
-    'if not defined MC_OK powershell -NoProfile -Command "try{[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;Invoke-WebRequest -UseBasicParsing -Uri \'%MC_URL%\' -OutFile \'%MC_PS1%\';exit 0}catch{exit 1}" && set "MC_OK=1"',
-    'if not defined MC_OK goto :fail_download',
-    'if not exist "%MC_PS1%" goto :fail_download',
-    '',
-    'rem --- check the download against the hash this web page was built with',
-    'set "MC_GOT="',
-    'for /f "skip=1 delims=" %%H in (\'certutil -hashfile "%MC_PS1%" SHA256 2^>nul\') do if not defined MC_GOT set "MC_GOT=%%H"',
-    'if not defined MC_GOT goto :fail_hash',
-    'set "MC_GOT=%MC_GOT: =%"',
-    'if /i not "%MC_GOT%"=="%MC_SHA256%" goto :fail_hash',
-    '',
-    'rem --- run it',
+    ':noadmin',
     'echo.',
-    'powershell -NoProfile -ExecutionPolicy Bypass -File "%MC_PS1%" ' + args,
-    'set "MC_RC=%errorlevel%"',
-    'goto :done',
+    ...both('noAdmin'),
     '',
-    ':fail_dir',
-    'echo.',
-    ...both('noDir'),
-    'goto :done',
-    '',
-    ':fail_download',
-    'echo.',
-    ...both('noDownload'),
-    'goto :done',
-    '',
-    ':fail_hash',
-    'echo.',
-    ...both('mismatch'),
-    'set "MC_RC=4"',
-    'goto :done',
-    '',
-    ':done',
-    'if defined MC_MADE if exist "%MC_DIR%" rmdir /s /q "%MC_DIR%" >nul 2>&1',
+    ':end',
     'echo.',
     ...both('close'),
     'pause >nul',
-    'exit /b %MC_RC%',
+    'exit /b 1',
     '',
     'rem prints a Chinese message given as \\uXXXX escapes (this file stays ASCII)',
     ':zh',
-    'powershell -NoProfile -Command "Write-Host ([regex]::Unescape(\'%~1\'))"',
+    '"' + PS + '" -NoProfile -Command "Write-Host ([regex]::Unescape(\'%~1\'))"',
     'exit /b 0',
     ''
   ];

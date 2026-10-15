@@ -71,77 +71,146 @@ test('launcher: header names what it is, the angle, the source URL, the repo and
   assert.ok(/mousecal uninstall launcher/.test(launcherCmd({ mode: 'uninstall' })));
 });
 
-test('launcher: self-elevates with the specified line, before anything touches the disk', () => {
+const psBlock = (c) => {
+  const m = /-Command "([^"\r\n]*)" & exit \/b\r\n/.exec(c);
+  assert.ok(m, 'the one long PowerShell line');
+  return m[1];
+};
+const zhCall = (s) => 'call :zh "' + [...s].map((ch) => ch.charCodeAt(0) < 128 ? ch : '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0')).join('') + '"';
+const PSEXE = '%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe';
+const INSTALL = { mode: 'install', measured: 7.5 };
+
+test('launcher: admin check is fltmc (full path, not net session), one marked self-elevation, nothing earlier touches the disk', () => {
   const c = launcherCmd({ mode: 'install', measured: 1 });
-  const elevate = `net session >nul 2>&1 || (powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs" & exit /b)`;
-  assert.ok(lines(c).includes(elevate));
-  const at = c.indexOf(elevate);
-  for (const later of ['mkdir', 'icacls', 'curl.exe', 'certutil', 'Bypass -File']) assert.ok(c.indexOf(later, at) > at, later);
-  assert.ok(!c.slice(0, at).match(/mkdir|icacls|curl|certutil|-File/), 'something runs before the elevation check');
+  const L = lines(c);
+  assert.ok(L.includes('"%SystemRoot%\\System32\\fltmc.exe" >nul 2>&1 || goto :elevate'));
+  assert.ok(/fltmc/.test(c) && !/net session/i.test(c));
+  assert.equal(L[L.indexOf('setlocal EnableExtensions DisableDelayedExpansion') + 1], 'set "MC_SELF=%~f0"');
+  assert.equal(L[L.indexOf('set "MC_SELF=%~f0"') + 1], 'cd /d "%SystemRoot%\\System32"', 'cd away from Downloads right after remembering the path');
+  // the marker: present -> never relaunch again, bilingual message, pause, exit
+  const marker = 'mousecal-elevated';
+  assert.ok(L.includes(`if /i "%~1"=="${marker}" goto :noadmin`));
+  assert.equal((c.match(/-Verb RunAs/g) || []).length, 1, 'exactly one elevation');
+  const relaunch = L.find((l) => l.includes('-Verb RunAs'));
+  assert.ok(relaunch.includes(`-ArgumentList '${marker}'`) && relaunch.includes('-FilePath $env:MC_SELF') && relaunch.includes('-ErrorAction Stop'));
+  assert.ok(L.indexOf(relaunch) > L.indexOf(`if /i "%~1"=="${marker}" goto :noadmin`), 'marker check comes before the relaunch');
+  const noadmin = c.slice(c.indexOf('\r\n:noadmin\r\n'), c.indexOf('\r\n:end\r\n'));
+  assert.ok(noadmin.includes('Still no administrator rights') && !noadmin.includes('RunAs') && /call :zh/.test(noadmin));
+  assert.ok(c.slice(c.indexOf('\r\n:end\r\n')).includes('pause >nul'));
+  // declined UAC / Start-Process failure: message and pause, not a silent close
+  const declined = c.slice(c.indexOf(relaunch), c.indexOf('\r\n:noadmin\r\n'));
+  assert.ok(declined.includes('Administrator permission was not granted') && declined.includes('goto :end'));
+  assert.ok(declined.includes(zhCall(LAUNCHER_ZH.declined)));
+  assert.ok(c.includes(zhCall(LAUNCHER_ZH.noAdmin)));
+  assert.ok(relaunch.includes('catch{exit 1}') && relaunch.endsWith('&& exit /b 0'));
+  // before the admin check nothing but set/cd runs; the happy path has no goto/label before the long line
+  const at = L.indexOf('"%SystemRoot%\\System32\\fltmc.exe" >nul 2>&1 || goto :elevate');
+  for (const l of L.slice(0, at)) assert.ok(/^(@echo off|rem |setlocal|set "MC_SELF|cd \/d)/.test(l), l);
+  assert.ok(L.findIndex((l) => l.includes('-Command "$ErrorActionPreference')) < L.indexOf(':elevate'));
+  assert.ok(!L.slice(at, L.findIndex((l) => l.includes('-Command "$ErrorActionPreference'))).some((l) => /^(:|goto|if|call)/.test(l)));
 });
 
-test('launcher: admin-only folder under %ProgramData%\\mousecal\\dl-<random>, locked with icacls before the download', () => {
-  const c = launcherCmd({ mode: 'install', measured: 1 });
-  assert.ok(c.includes('set "MC_ROOT=%ProgramData%\\mousecal"'));
-  assert.ok(/set "MC_DIR=%MC_ROOT%\\dl-%RANDOM%/.test(c));
-  assert.ok(!/%TEMP%|%TMP%|%USERPROFILE%|%LOCALAPPDATA%|%APPDATA%/i.test(c), 'a user-writable location is used');
-  const acl = '/inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F';
-  const aclLines = lines(c).filter((l) => l.startsWith('icacls '));
-  assert.ok(aclLines.length >= 3);
-  assert.ok(aclLines.some((l) => l.includes('/setowner *S-1-5-32-544')), 'a pre-made folder gets an administrators owner');
-  assert.ok(lines(c).some((l) => l.startsWith('icacls "%MC_DIR%" ' + acl)), 'download folder is locked');
-  assert.ok(c.indexOf('icacls "%MC_DIR%"') < c.indexOf('curl.exe -fsSL'), 'locked before the download');
-  assert.ok(c.indexOf('mkdir "%MC_DIR%"') < c.indexOf('icacls "%MC_DIR%"'));
-  // deleted at the end, and only a folder this run made
-  assert.ok(/if defined MC_MADE if exist "%MC_DIR%" rmdir \/s \/q "%MC_DIR%"/.test(c));
-  assert.ok(c.indexOf('rmdir /s /q') > c.indexOf('Bypass -File'));
+test('launcher: MC_SELF is an env var, %~f0 never appears inside single quotes; powershell/fltmc always by full path', () => {
+  for (const o of [INSTALL, { mode: 'uninstall', restoreEpp: true }]) {
+    const c = launcherCmd(o);
+    assert.equal((c.match(/%~f0/g) || []).length, 1);
+    assert.ok(!/'[^'\r\n]*%~f0/.test(c) && !/%~f0[^\r\n]*'/.test(c));
+    assert.ok(c.includes('set "MC_SELF=%~f0"'));
+    for (const l of lines(c).filter((x) => /powershell(\.exe)?\b/i.test(x) && !/^rem /.test(x))) {
+      const cmd = l.replace(/'[^']*'/g, '');
+      if (/(^|[ "])powershell(\.exe)?[ "]/i.test(cmd)) assert.ok(cmd.startsWith('"' + PSEXE + '" '), 'bare powershell: ' + l.slice(0, 80));
+    }
+    assert.ok(!/(^|\r\n)(powershell|fltmc|curl|certutil|icacls)\b/i.test(c), 'a command is looked up through PATH / the Downloads folder');
+  }
 });
 
-test('launcher: curl.exe -fsSL with an Invoke-WebRequest -UseBasicParsing -OutFile fallback', () => {
-  const c = launcherCmd({ mode: 'install', measured: 1 });
-  assert.ok(c.includes('curl.exe -fsSL -o "%MC_PS1%" "%MC_URL%"'));
-  assert.ok(c.includes('where curl.exe'));
-  assert.ok(/Invoke-WebRequest -UseBasicParsing -Uri '%MC_URL%' -OutFile '%MC_PS1%'/.test(c));
+test('launcher: the PowerShell block is one cmd-safe line (no double quote, no percent, no !, no ^), single -Command, short enough', () => {
+  const c = launcherCmd(INSTALL);
+  const b = psBlock(c);
+  assert.ok(!/["%!^\r\n]/.test(b), 'cmd would change this');
+  assert.ok(lines(c).every((l) => l.length < 7500), 'cmd line limit is 8191');
+  assert.ok(!/-EncodedCommand|-enc\b/i.test(c));
+  assert.ok(lines(c).filter((l) => /^"%SystemRoot%.*powershell\.exe" -NoProfile -Command "\$ErrorActionPreference/.test(l)).length === 1);
+});
+
+test('launcher: new random folder %ProgramData%\\mousecal-dl-<guid> created with its ACL (protected, owner Administrators, only Administrators + SYSTEM)', () => {
+  const b = psBlock(launcherCmd(INSTALL));
+  assert.ok(!/icacls|mkdir|ProgramData\\mousecal\b/.test(launcherCmd(INSTALL)), 'no shared root, no icacls sequence');
+  assert.ok(b.includes("Join-Path $env:ProgramData ('mousecal-dl-'+[guid]::NewGuid().ToString('N'))"));
+  assert.ok(b.includes('[IO.Directory]::CreateDirectory($p,$sec)'));
+  assert.ok(b.includes('$sec.SetAccessRuleProtection($true,$false)'), 'no inheritance');
+  assert.ok(b.includes('$sec.SetOwner($adm)') && b.includes("SecurityIdentifier('S-1-5-32-544')") && b.includes("SecurityIdentifier('S-1-5-18')"));
+  assert.ok(b.includes("'FullControl','ContainerInherit,ObjectInherit','None','Allow'"));
+  assert.equal((b.match(/AddAccessRule/g) || []).length, 1, 'one rule per SID through one loop, no other principals');
+  assert.ok(b.includes('foreach($s in $adm,$sys)'));
+  assert.ok(!/Users|Everyone|S-1-1-0|S-1-5-32-545|S-1-5-11|Authenticated/i.test(b));
+  const order = ['$sec.SetAccessRuleProtection', '$sec.SetOwner', 'AddAccessRule', 'NewGuid', 'GetAttributes($p)}catch', 'CreateDirectory($p,$sec)', 'DownloadFile'].map((s) => b.indexOf(s));
+  assert.ok(order.every((v, i) => v > 0 && (i === 0 || v > order[i - 1])), 'ACL is built before the folder exists, the folder is created before the download: ' + order);
+  // refuses an existing path / a link, and double-checks after creating
+  assert.ok(b.includes("if($ex){throw 'the folder already exists'}"));
+  assert.ok(b.includes('if([IO.File]::GetAttributes($p) -band 1024){throw') && b.includes('AreAccessRulesProtected'));
+  // a path that was not made by this run is never deleted
+  assert.ok(b.includes('$mine=$true') && b.includes('finally{if($mine){try{d $p}'));
+  assert.ok(b.indexOf('$mine=$true') > b.indexOf('CreateDirectory($p,$sec)'));
+  assert.ok(!/%TEMP%|%TMP%|%USERPROFILE%|%LOCALAPPDATA%|%APPDATA%|env:TEMP|env:TMP|env:USERPROFILE|env:LOCALAPPDATA|env:APPDATA/i.test(launcherCmd(INSTALL)), 'a user-writable location is used');
+});
+
+test('launcher: cleanup removes links themselves and never follows them', () => {
+  const b = psBlock(launcherCmd(INSTALL));
+  const fn = [b.slice(b.indexOf('function d('), b.indexOf('$rc=1'))];
+  assert.ok(fn, 'delete function');
+  assert.ok(/-not \(\$t -band 1024\)/.test(fn[0]), 'only real directories are entered');
+  assert.ok(fn[0].includes('[IO.Directory]::Delete($x)') && !/Recurse|\$true\)/.test(fn[0]), 'plain Delete never recurses into a link');
+  assert.ok(!/Remove-Item|rmdir|rd /i.test(launcherCmd(INSTALL)));
+});
+
+test('launcher: WebClient with the system proxy and TLS 1.2, no curl / Invoke-WebRequest / certutil', () => {
+  const c = launcherCmd(INSTALL), b = psBlock(c);
+  assert.ok(b.includes('New-Object Net.WebClient') && b.includes('[Net.WebRequest]::GetSystemWebProxy()') && b.includes('DefaultCredentials'));
+  assert.ok(b.includes('SecurityProtocol=[Net.SecurityProtocolType]::Tls12'));
+  assert.ok(b.includes('$w.DownloadFile($env:MC_URL,$f)'));
+  assert.ok(!/curl|Invoke-WebRequest|certutil|bitsadmin|DownloadString|irm\b/i.test(c));
   assert.ok(c.includes('set "MC_URL=' + SITE_BASE + '/setup.ps1"'));
-  assert.ok(c.includes('set "MC_PS1=%MC_DIR%\\setup.ps1"'));
+  assert.ok(b.includes("$f=Join-Path $p 'setup.ps1'"));
 });
 
-test('launcher: verifies SHA256 with certutil, case-insensitive, spaces stripped, and stops on a mismatch before running anything', () => {
-  const c = launcherCmd({ mode: 'install', measured: 1 });
-  assert.ok(c.includes('set "MC_SHA256=' + SETUP_SHA256 + '"'), 'contains SETUP_SHA256');
-  assert.ok(c.includes('certutil -hashfile "%MC_PS1%" SHA256'));
-  assert.ok(c.includes('set "MC_GOT=%MC_GOT: =%"'), 'spaces stripped');
-  assert.ok(c.includes('if /i not "%MC_GOT%"=="%MC_SHA256%" goto :fail_hash'), 'case-insensitive compare');
-  assert.ok(c.indexOf('goto :fail_hash') < c.indexOf('Bypass -File'), 'the check comes before the run');
-  // an empty / unreadable hash also stops
-  assert.ok(c.includes('if not defined MC_GOT goto :fail_hash'));
-  // the mismatch block: bilingual message, no setup run in it
-  const block = c.slice(c.indexOf('\r\n:fail_hash\r\n'), c.indexOf('\r\n:done\r\n'));
-  assert.ok(block.length > 20, 'mismatch block found');
-  assert.ok(!block.includes('-File'));
-  assert.ok(block.includes('does not match the version on the website'));
+test('launcher: SHA256 via .NET, compared with SETUP_SHA256, a mismatch runs nothing and still cleans up', () => {
+  const c = launcherCmd(INSTALL), b = psBlock(c);
+  assert.ok(c.includes('set "MC_SHA256=' + SETUP_SHA256 + '"') && c.includes('Expected SHA256    : ' + SETUP_SHA256), 'contains SETUP_SHA256');
+  assert.ok(!/certutil/i.test(c));
+  assert.ok(b.includes('[Security.Cryptography.SHA256]::Create().ComputeHash($s)') && b.includes("Replace('-','')"));
+  assert.ok(b.includes('if($g -ne $env:MC_SHA256){$rc=4;'), 'case-insensitive -ne, stops with 4');
+  const mismatch = /if\(\$g -ne \$env:MC_SHA256\)\{(.*?)\}else\{/.exec(b)[1];
+  assert.ok(!mismatch.includes('-File') && mismatch.includes('does not match the version on the website'));
+  assert.ok(b.indexOf('$g -ne $env:MC_SHA256') < b.indexOf('-File $f'), 'the check comes before the run');
+  assert.ok(b.indexOf('finally{if($mine)') > b.indexOf('-File $f'), 'cleanup after the run, also reached on a mismatch (finally)');
+  // bilingual messages: zh as \\uXXXX, decoding back to the exact sentences
   assert.equal(LAUNCHER_ZH.mismatch, '下載的檔案和網站上的版本不一致，已停止。請重新整理網頁再下載一次。');
-  assert.ok(block.includes(`call :zh "${[...LAUNCHER_ZH.mismatch].map((ch) => '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0')).join('')}"`));
-  // the \\uXXXX escapes decode back to the exact sentence
-  const m = /call :zh "([^"]*)"/.exec(block);
-  assert.equal(decodeEscapes(m[1]), LAUNCHER_ZH.mismatch);
-  // hash in the file is whatever was passed in (lower-cased), and a bad one is refused
+  for (const key of ['working', 'noDir', 'noDownload', 'mismatch', 'close']) {
+    const re = /m '([^']*)' '([^']*)'/g;
+    const found = [...b.matchAll(re)].find((x) => decodeEscapes(x[2]) === LAUNCHER_ZH[key]);
+    assert.ok(found, 'zh message ' + key);
+    assert.ok(!/[^\x20-\x7e]/.test(found[2]));
+  }
   const upper = 'ABCDEF0123456789'.repeat(4);
   assert.ok(launcherCmd({ mode: 'install', measured: 1, sha256: upper }).includes('set "MC_SHA256=' + upper.toLowerCase() + '"'));
   assert.throws(() => launcherCmd({ mode: 'install', measured: 1, sha256: 'xyz' }));
   assert.throws(() => launcherCmd({ mode: 'install', measured: 1, sha256: SETUP_SHA256 + '"&calc' }));
 });
 
-test('launcher: runs setup.ps1 with -File and the right arguments, one single pause with the close message', () => {
-  const inst = launcherCmd({ mode: 'install', measured: 7.5 });
-  assert.ok(lines(inst).includes('powershell -NoProfile -ExecutionPolicy Bypass -File "%MC_PS1%" -Measured 7.5 -NoPause'));
-  assert.ok(lines(launcherCmd({ mode: 'install', measured: -3.14 })).includes('powershell -NoProfile -ExecutionPolicy Bypass -File "%MC_PS1%" -Measured -3.1 -NoPause'));
-  assert.ok(lines(launcherCmd({ mode: 'install', measured: -0.04 })).some((l) => l.endsWith('-Measured 0.0 -NoPause')));
-  assert.equal((inst.match(/^pause\b/gm) || []).length, 1, 'exactly one pause');
+test('launcher: runs setup.ps1 by full powershell path with -File and the right arguments, then one pause with the close message', () => {
+  const run = (o) => /& \(\$env:SystemRoot\+'\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe'\) (-NoProfile -ExecutionPolicy Bypass -File \$f [^;]*);\$rc=\[int\]\$LASTEXITCODE/.exec(psBlock(launcherCmd(o)));
+  assert.equal(run(INSTALL)[1], '-NoProfile -ExecutionPolicy Bypass -File $f -Measured 7.5 -NoPause');
+  assert.equal(run({ mode: 'install', measured: -3.14 })[1], '-NoProfile -ExecutionPolicy Bypass -File $f -Measured -3.1 -NoPause');
+  assert.ok(run({ mode: 'install', measured: -0.04 })[1].endsWith('-Measured 0.0 -NoPause'));
+  const inst = launcherCmd(INSTALL), b = psBlock(inst);
+  assert.ok(b.includes('$rc=[int]$LASTEXITCODE') && b.endsWith('exit $rc'));
+  assert.equal((b.match(/ReadKey/g) || []).length, 1, 'one pause at the end of the block');
+  assert.ok(b.indexOf('ReadKey') > b.indexOf('finally{if($mine)'), 'cleanup before the final pause');
+  assert.ok(inst.includes('& exit /b\r\n'), 'cmd leaves right after the block on the same line');
   assert.ok(!/Read-Host/.test(inst));
   assert.equal(LAUNCHER_ZH.close, '按任意鍵關閉');
-  assert.ok(inst.includes('call :zh "' + [...LAUNCHER_ZH.close].map((ch) => '\\u' + ch.charCodeAt(0).toString(16).padStart(4, '0')).join('') + '"'));
-  assert.ok(inst.indexOf('rmdir /s /q') < inst.indexOf('\r\npause'), 'cleanup before the final pause');
+  assert.ok(inst.includes(zhCall(LAUNCHER_ZH.close)));
   assert.ok(!inst.includes('-Uninstall') && !inst.includes('-Rotation'));
   assert.throws(() => launcherCmd({ mode: 'install', measured: 45.5 }));
   assert.throws(() => launcherCmd({ mode: 'install', measured: NaN }));
@@ -151,19 +220,38 @@ test('launcher: runs setup.ps1 with -File and the right arguments, one single pa
   assert.throws(() => launcherCmd({ mode: 'install', measured: 1, base: 'https://x.invalid" & calc & "' }));
 });
 
+test('launcher: no irm, iex, Invoke-Expression, scriptblock::Create, certutil, net session or Win+R anywhere', () => {
+  for (const o of [INSTALL, { mode: 'uninstall' }, { mode: 'uninstall', restoreEpp: true }]) {
+    const c = launcherCmd(o);
+    assert.ok(!/\birm\b|\biex\b|Invoke-Expression|scriptblock|certutil|net session|Win\+R/i.test(c));
+  }
+});
+
 test('launcher: uninstall variant (with and without restoring pointer precision)', () => {
   const plain = launcherCmd({ mode: 'uninstall', restoreEpp: false });
   const epp = launcherCmd({ mode: 'uninstall', restoreEpp: true });
-  assert.ok(lines(plain).includes('powershell -NoProfile -ExecutionPolicy Bypass -File "%MC_PS1%" -Uninstall -NoPause'));
-  assert.ok(lines(epp).includes('powershell -NoProfile -ExecutionPolicy Bypass -File "%MC_PS1%" -Uninstall -RestorePointerPrecision -NoPause'));
+  assert.ok(psBlock(plain).includes('-File $f -Uninstall -NoPause;'));
+  assert.ok(psBlock(epp).includes('-File $f -Uninstall -RestorePointerPrecision -NoPause;'));
   assert.ok(!plain.includes('RestorePointerPrecision') && !/-Measured/.test(plain + epp));
   assert.equal(launcherCmd({ mode: 'uninstall' }), plain, 'default is not restoring');
   assert.equal(launcherCmd({ mode: 'uninstall', restoreEpp: 'yes' }), plain, 'only a real true restores');
   assert.equal(launcherCmd({ mode: 'uninstall', measured: 12 }), plain, 'the angle is ignored');
   for (const c of [plain, epp]) {
-    assert.ok(c.includes(SETUP_SHA256) && c.includes('net session >nul 2>&1 || (powershell'));
-    assert.equal((c.match(/^pause\b/gm) || []).length, 1);
+    assert.ok(c.includes(SETUP_SHA256) && c.includes('fltmc.exe'));
+    assert.equal((c.match(/^pause\b/gm) || []).length, 1, 'cmd-level error path');
   }
+});
+
+test('launcher: the PowerShell block parses (static check only, the block is NEVER executed)', { skip: process.platform !== 'win32' }, () => {
+  const script = '$t=$null;$e=$null;$null=[System.Management.Automation.Language.Parser]::ParseInput($env:MC_BLOCK,[ref]$t,[ref]$e);' +
+    'if($e.Count){$e|ForEach-Object{[Console]::Error.WriteLine($_.Message+\' @\'+$_.Extent.StartOffset)};exit 1};exit 0';
+  for (const o of [INSTALL, { mode: 'install', measured: -45 }, { mode: 'uninstall' }, { mode: 'uninstall', restoreEpp: true }]) {
+    const b = psBlock(launcherCmd(o));
+    // only ever ParseInput: the text goes in through an environment variable and is never invoked
+    execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { env: { ...process.env, MC_BLOCK: b }, stdio: ['ignore', 'pipe', 'pipe'] });
+  }
+  // the parser really does reject broken text (so the check above means something)
+  assert.throws(() => execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { env: { ...process.env, MC_BLOCK: 'if(' }, stdio: ['ignore', 'pipe', 'pipe'] }));
 });
 
 test('file names: mousecal-setup-<angle>.cmd and mousecal-uninstall.cmd', () => {
@@ -210,7 +298,10 @@ test('page: download buttons, steps, fallback button (no auto-download), uninsta
 
 test('page: the four steps say what the owner specified (zh and en), in simple words', () => {
   const z = STRINGS.zh;
-  assert.equal(z.dlS1, '打開剛下載的 {file}');
+  assert.equal(z.dlS1, '打開剛下載的 mousecal-setup 開頭的檔案');
+  assert.equal(z.dlStarted, '已經開始下載 {file}（如果瀏覽器問要不要保留，請按「保留」）。檔名可能會多一個 (1)。');
+  assert.ok(!/已下載|下載好了/.test(z.dlStarted), 'does not claim the file arrived');
+  assert.ok(/has started/.test(STRINGS.en.dlStarted) && !/Downloaded/.test(STRINGS.en.dlStarted));
   assert.equal(z.dl2, '如果出現「Windows 已保護您的電腦」，按「其他資訊」→「仍要執行」');
   assert.equal(z.dl3, '出現「是否允許…變更」按「是」');
   assert.equal(z.dl4, '黑色視窗跑完，回到這裡按「再量一次」');
@@ -232,7 +323,7 @@ test('disclosure describes the launcher: downloads setup.ps1, checks SHA256 agai
 
 test('README documents the launcher, the hash, the folder and the ClickFix reasoning', () => {
   const r = read('README.md');
-  for (const needle of ['mousecal-setup-', 'mousecal-uninstall.cmd', 'setup-hash.js', 'SETUP_SHA256', 'certutil', 'curl.exe', '%ProgramData%\\mousecal\\dl-', 'ClickFix', 'MOUSECAL_BUILD_OUT', 'launcher.test.mjs', '下載安裝程式']) {
+  for (const needle of ['mousecal-setup-', 'mousecal-uninstall.cmd', 'setup-hash.js', 'SETUP_SHA256', 'fltmc', 'WebClient', 'mousecal-elevated', '%ProgramData%\\mousecal-dl-<guid>', 'ClickFix', 'MOUSECAL_BUILD_OUT', 'launcher.test.mjs', '下載安裝程式']) {
     assert.ok(r.includes(needle), 'README lacks ' + needle);
   }
 });

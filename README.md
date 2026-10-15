@@ -99,19 +99,21 @@ checkbox). The file is pure ASCII with CRLF line endings; Chinese messages are p
 escapes so no code page can garble them. It starts with a comment header (what it is, the measured angle, the source URL,
 this repository, the expected SHA256) and then:
 
-1. `net session >nul 2>&1 || (powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs" & exit /b)`
-   (asks for administrator rights, i.e. the UAC prompt, if it is not elevated yet).
-2. Makes `%ProgramData%\mousecal\dl-<random>` (the parent is refused if it is a link, owned by Administrators and locked with
-   `icacls ... /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F`), so nothing that is later run as
-   administrator sits in a folder a normal user can write to.
-3. Downloads `<SITE_BASE>/setup.ps1` there with `curl.exe -fsSL` (built into Windows 10 1803+), or with
-   `Invoke-WebRequest -UseBasicParsing -OutFile` when curl is missing.
-4. `certutil -hashfile ... SHA256`, compared case-insensitively (spaces stripped) with `SETUP_SHA256`, the hash baked
+1. `fltmc.exe` (full path) tells whether it is already elevated. If not, it relaunches itself once with `-Verb RunAs` and the
+   argument `mousecal-elevated`; if that argument is present and it is still not administrator, or the UAC prompt is
+   declined, it prints a bilingual message and waits for a key (it never relaunches twice, never closes silently).
+2. From here everything is ONE elevated `powershell.exe -Command` line (cmd has nothing left to re-read). It creates a
+   brand-new `%ProgramData%\mousecal-dl-<guid>` with `[IO.Directory]::CreateDirectory(path, DirectorySecurity)`: the ACL
+   (protected, owner Administrators, only Administrators + SYSTEM with full control) exists from the moment the folder
+   exists, there is no shared `%ProgramData%\mousecal` root and no `icacls` step. It refuses a path that already exists or
+   is a link.
+3. Downloads `<SITE_BASE>/setup.ps1` there with `System.Net.WebClient` (system proxy, TLS 1.2).
+4. SHA256 via `System.Security.Cryptography.SHA256`, compared with `SETUP_SHA256`, the hash baked
    into the launcher from `setup-hash.js`. A mismatch prints a bilingual message
    (「下載的檔案和網站上的版本不一致，已停止。請重新整理網頁再下載一次。」), runs nothing, and the folder is deleted.
-5. `powershell -NoProfile -ExecutionPolicy Bypass -File "<that file>" -Measured <deg> -NoPause`
+5. `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File <that file> -Measured <deg> -NoPause`
    (or `-Uninstall [-RestorePointerPrecision] -NoPause`).
-6. Deletes the folder and does one single `pause` (「按任意鍵關閉」); `-NoPause` stops setup.ps1 from pausing too.
+6. Deletes the folder (links inside are removed, never followed) and does one single pause (「按任意鍵關閉」); `-NoPause` stops setup.ps1 from pausing too.
 
 There is no `irm`, `iex`, `[scriptblock]::Create` or Win+R in this flow. The hash is also shown in small text under
 Advanced on the page. The hash proves the file equals the one deployed with the page; the trust root is still the site.
@@ -305,7 +307,7 @@ service key, and also waits for a key. That is why completion is detected by obs
   against the SHA256 of the `setup.ps1` deployed with the page (a half-deployed site or a swapped file is refused),
   everything setup.ps1 downloads is pinned by SHA256 (the zip and each file inside it) or must carry a Microsoft
   signature, and you can read both files first or run setup.ps1 with `-DryRun`. The launcher is not code signed.
-- The launcher downloads, verifies and runs setup.ps1 from an administrators-only folder under `%ProgramData%`, never
+- The launcher downloads, verifies and runs setup.ps1 from an brand-new administrators-only folder under `%ProgramData%` (`mousecal-dl-<guid>`), never
   from `%TEMP%` or the Downloads folder, because it is already elevated when it does so.
 - Nothing is executed from a user-writable location while elevated: the zip is hashed in memory and staged in
   an administrators-only folder; the validator script and DLLs it loads live there or under Program Files.
@@ -375,7 +377,7 @@ MIT licensed, see `LICENSE`. By [Hydr0neFN](https://github.com/Hydr0neFN).
 **為什麼改成下載檔案：** 以前是請使用者把 PowerShell 指令貼進 Win+R，這跟惡意程式常用的「ClickFix」手法一樣，
 Microsoft Defender 有偵測（`Behavior:Win32/ClickFix`、`SuspClickFix`、「Suspicious command in RunMRU」），擋廣告的外掛也會擋。
 現在的主要流程是下載 `.cmd` 檔再打開（用記事本就看得到每一行）：它先要求系統管理員權限，在
-`%ProgramData%\mousecal\dl-<亂數>`（只有系統管理員能寫入）下載 `setup.ps1`，用 `certutil` 核對 SHA256 是否等於網頁
+全新的 `%ProgramData%\mousecal-dl-<guid>`（建立時就只有系統管理員和 SYSTEM 能存取）下載 `setup.ps1`，用 .NET 的 SHA256 核對 SHA256 是否等於網頁
 （`setup-hash.js`，「進階」裡也看得到）的值，不同就停止，相同才執行，最後刪掉資料夾。檔案沒有程式碼簽章，所以 Windows 會顯示
 「Windows 已保護您的電腦」，請按「其他資訊」→「仍要執行」。舊的 Win+R 指令還在「進階：用 PowerShell 指令安裝」裡（預設收起來，
 並提醒有些防毒軟體會覺得可疑）。
