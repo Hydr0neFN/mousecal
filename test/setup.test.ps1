@@ -10,6 +10,21 @@ function Check([string]$Name, [bool]$Cond, [string]$Info = '') {
     if ($Cond) { Write-Host "ok   $Name" } else { Write-Host "FAIL $Name $Info" -ForegroundColor Red; $script:fails++ }
 }
 function Throws([scriptblock]$Block) { try { & $Block | Out-Null; return $false } catch { return $true } }
+
+# HARD GUARD (2026-10-15 incident): on a PC with UAC "never notify", one un-stubbed elevation in a test runs the
+# REAL installed setup.ps1 silently. These global wrappers refuse every elevation / real system change; a test
+# that needs Start-Process defines its own function in its own scope, which takes precedence over these.
+function global:Start-Process {
+    param($FilePath, $ArgumentList, $Verb, $WorkingDirectory, $WindowStyle, $RedirectStandardOutput, $RedirectStandardError, [switch]$Wait, [switch]$PassThru, [switch]$NoNewWindow)
+    if ($Verb -eq 'RunAs') { throw "TEST GUARD: elevation attempted ($FilePath $ArgumentList)" }
+    if ([string]$FilePath -match '(?i)(installer|uninstaller|writer|pnputil|wscript|cscript)\.exe|\\RawAccel\\') { throw "TEST GUARD: real system tool started ($FilePath)" }
+    $p = @{ FilePath = $FilePath }
+    foreach ($k in 'ArgumentList', 'WorkingDirectory', 'WindowStyle', 'RedirectStandardOutput', 'RedirectStandardError') { if ($PSBoundParameters.ContainsKey($k)) { $p[$k] = $PSBoundParameters[$k] } }
+    Microsoft.PowerShell.Management\Start-Process @p -Wait:$Wait -PassThru:$PassThru -NoNewWindow:$NoNewWindow
+}
+foreach ($n in 'Unregister-ScheduledTask', 'Register-ScheduledTask', 'Start-ScheduledTask') {
+    Set-Item "function:global:$n" ([scriptblock]::Create("throw 'TEST GUARD: real $n called'"))
+}
 function ThrowsCode([scriptblock]$Block) { try { & $Block | Out-Null; return -1 } catch { $c = $_.Exception.Data['ExitCode']; if ($c) { return [int]$c } else { return 0 } } }
 
 $env:MOUSECAL_NO_MAIN = '1'
