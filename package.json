@@ -1,0 +1,9 @@
+{
+  "name": "mouse-cal",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/analysis.test.mjs",
+    "build": "node tools/build-setup.mjs"
+  }
+}

@@ -1,0 +1,11 @@
+node_modules/
+.wrangler/
+.dev.vars
+*.log
+*.bak
+*.bak-*
+.DS_Store
+Thumbs.db
+# raw captures (personal measurement data) are never committed
+logs/
+capture_*.csv
