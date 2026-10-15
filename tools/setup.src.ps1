@@ -1149,31 +1149,41 @@ function Restore-UrlProtocolSnapshot($Snap, [string]$Key = '') {
 
 # Removes the registry key (only if it points at our handler) and our three files; the folder
 # goes too when nothing else is in it. Never throws for things that are already gone.
-function Unregister-UrlProtocol([string]$Dir = '', [string]$Key = '') {
+function Unregister-UrlProtocol([string]$Dir = '', [string]$Key = '', [switch]$Owned) {
     if (-not $Dir) { $Dir = Get-HandlerDir }
     if (-not $Key) { $Key = $ProtocolKey }
     if (Test-Path -LiteralPath $Key) {
         $cmd = ''
         $ck = Join-Path $Key 'shell\open\command'
         if (Test-Path -LiteralPath $ck) { $cmd = [string](Get-Item -LiteralPath $ck).GetValue('') }
-        if (-not $cmd -or $cmd.IndexOf((Join-Path $Dir 'handler.vbs'), [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+        $default = [string](Get-Item -LiteralPath $Key).GetValue('')
+        # ours = the command runs our handler.vbs, or (a half-written key from an interrupted run) no command yet
+        # but our exact default value; anything else belongs to someone else and is left alone
+        if ($Owned -or ($cmd -and $cmd.IndexOf((Join-Path $Dir 'handler.vbs'), [StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+            (-not $cmd -and $default -eq 'URL:mousecal Protocol')) {
             Remove-Item -LiteralPath $Key -Recurse -Force
         } else {
             Warn 'Registry key {0} points somewhere else ({1}); it is left alone.' '登錄機碼 {0} 指向別的地方（{1}）；不動它。' @($Key, $cmd)
         }
     }
+    # only files that carry our own header are deleted (another tool's files in that folder are left alone)
+    $sig = @{ 'handler.vbs' = "' mousecal URL handler (installed by setup.ps1)"; 'handler.ps1' = '# mousecal URL handler (installed by setup.ps1)'; 'setup.ps1' = 'mousecal setup.ps1 -- applies a sensor-rotation correction' }
     foreach ($n in 'handler.vbs', 'handler.ps1', 'setup.ps1') {
         $f = Join-Path $Dir $n
-        if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force }
+        if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { continue }
+        $head = ''
+        try { $head = [string](Get-Content -LiteralPath $f -TotalCount 6 -ErrorAction Stop) -join "`n" } catch { }
+        if ($Owned -or $head.IndexOf($sig[$n], [StringComparison]::Ordinal) -ge 0) { Remove-Item -LiteralPath $f -Force }
+        else { Warn '{0} was not written by this tool; it is left alone.' '{0} 不是這個工具寫入的；不動它。' @($f) }
     }
     Remove-EmptyDirs $Dir
 }
 
 # Uninstall step (honours -DryRun); a problem here never aborts the rest of the uninstall.
-function Remove-UrlProtocolStep {
+function Remove-UrlProtocolStep([switch]$Owned) {
     if (-not (Test-UrlProtocolPresent)) { return }
     if ($DryRun) { Dry 'Remove the mousecal:// URL protocol ({0}) and the handler folder {1}' '移除 mousecal:// 網址通訊協定（{0}）與處理程式資料夾 {1}' @($ProtocolKey, (Get-HandlerDir)); return }
-    try { Unregister-UrlProtocol; Ok 'Removed the mousecal:// URL protocol and {0}.' '已移除 mousecal:// 網址通訊協定與 {0}。' @((Get-HandlerDir)) }
+    try { Unregister-UrlProtocol -Owned:$Owned; Ok 'Removed the mousecal:// URL protocol and {0}.' '已移除 mousecal:// 網址通訊協定與 {0}。' @((Get-HandlerDir)) }
     catch { Warn 'Could not fully remove the mousecal:// link ({0}). It is harmless; delete {1} and the registry key {2} by hand if you want.' '無法完整移除 mousecal:// 連結（{0}）。它無害；想清掉的話請手動刪除 {1} 與登錄機碼 {2}。' @($_.Exception.Message, (Get-HandlerDir), $ProtocolKey) }
 }
 
@@ -1250,7 +1260,7 @@ function Invoke-Rollback {
         }
         if ($tx.ProtocolRegistered) {
             try {
-                if (-not $tx.PriorProtocol) { Unregister-UrlProtocol }
+                if (-not $tx.PriorProtocol) { Unregister-UrlProtocol -Owned }
                 else { Restore-UrlProtocolSnapshot $tx.ProtocolSnapshot }      # the key's previous values, exactly (or no key if there was none)
             } catch { $problems.Add('mousecal:// link: ' + $_.Exception.Message) }
         }
@@ -1380,8 +1390,25 @@ function Resolve-Arguments {
 
 # ================================================================== uninstall
 # Removes the apply task and the legacy VBS (honours -DryRun).
-function Remove-ApplyTask {
-    $hasTask = [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
+# A task with our name is removed only when its action is ours: writer.exe from this AppDir (current form) or
+# wscript.exe running our legacy apply-rawaccel.vbs. A same-named task that does anything else is left alone.
+function Test-OwnApplyTask($Task) {
+    foreach ($a in @($Task.Actions)) {
+        $exe = [string]$a.Execute; $arg = [string]$a.Arguments
+        if (-not $exe.Trim('"')) { continue }
+        $exeLeaf = (Split-Path -Leaf ($exe.Trim('"'))).ToLowerInvariant()
+        if ($exeLeaf -eq 'writer.exe' -and $exe.Trim('"').Equals((Join-Path $AppDir 'writer.exe'), [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        if ($exeLeaf -eq 'wscript.exe' -and $arg.IndexOf($VbsPath, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+    }
+    return $false
+}
+function Remove-ApplyTask([switch]$Owned) {
+    $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    $hasTask = [bool]$t
+    if ($hasTask -and -not $Owned -and -not (Test-OwnApplyTask $t)) {
+        Warn 'A scheduled task "{0}" exists but does not run this tool''s writer.exe; it is left alone.' '工作排程「{0}」存在，但執行的不是這個工具的 writer.exe；不動它。' @($TaskName)
+        $hasTask = $false
+    }
     if ($hasTask) {
         if ($DryRun) { Dry 'Remove scheduled task "{0}"' '移除工作排程「{0}」' @($TaskName) }
         else { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false; Ok 'Removed scheduled task "{0}"' '已移除工作排程「{0}」' @($TaskName) }
@@ -1442,8 +1469,9 @@ function Invoke-Uninstall {
         Say 'The Raw Accel driver was already there before this tool; it is left installed.' '這個工具安裝之前就已經有 Raw Accel 驅動程式，所以保留它。'
     }
 
-    Remove-ApplyTask
-    Remove-UrlProtocolStep
+    # a valid marker proves this tool registered them (and an install always replaces a same-named task)
+    Remove-ApplyTask -Owned
+    Remove-UrlProtocolStep -Owned
 
     # --- files
     if ($marker.createdAppDir) {
@@ -1715,7 +1743,7 @@ function Invoke-Install($Arg) {
             Ok 'Registered the mousecal:// URL protocol; handler files are in {0} (administrators can write, everyone can read).' '已註冊 mousecal:// 網址通訊協定；處理程式檔案在 {0}（只有系統管理員能修改，所有人可讀取）。' @((Get-HandlerDir))
         } catch {
             Warn 'Could not set up the one-click link ({0}). Everything else is installed; the copy-command method on the website keeps working.' '無法設定一鍵連結（{0}）。其他都已安裝完成；網站上「複製指令」的方法仍然可用。' @($_.Exception.Message)
-            try { if (-not $tx.PriorProtocol) { Unregister-UrlProtocol } else { Restore-UrlProtocolSnapshot $tx.ProtocolSnapshot } } catch { }
+            try { if (-not $tx.PriorProtocol) { Unregister-UrlProtocol -Owned } else { Restore-UrlProtocolSnapshot $tx.ProtocolSnapshot } } catch { }
         }
 
         # ---- 6. apply now (never while a listed game runs)

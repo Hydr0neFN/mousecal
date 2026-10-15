@@ -533,7 +533,7 @@ try {
 # ---- structure checks for the install / uninstall wiring
 Check 'install registers the protocol inside the transaction, after the startup task, before the final apply' ($src -match '(?s)Register-ApplyTask \$SettingsPath.*?Register-UrlProtocol.*?\$writer = Join-Path')
 Check 'install marks the protocol for rollback BEFORE registering it' ($src -match '(?s)\$tx\.ProtocolRegistered = \$true.*?Register-UrlProtocol')
-Check 'rollback unregisters the protocol (unless it existed before this run, then it restores the key)' ($src -match '(?s)function Invoke-Rollback.*?ProtocolRegistered.*?-not \$tx\.PriorProtocol\) \{ Unregister-UrlProtocol \}.*?Restore-UrlProtocolSnapshot')
+Check 'rollback unregisters the protocol (unless it existed before this run, then it restores the key)' ($src -match '(?s)function Invoke-Rollback.*?ProtocolRegistered.*?-not \$tx\.PriorProtocol\) \{ Unregister-UrlProtocol( -Owned)? \}.*?Restore-UrlProtocolSnapshot')
 Check 'uninstall removes the protocol in both branches (marker / no marker)' ((([regex]::Matches($src, 'Remove-UrlProtocolStep')).Count) -ge 3)
 Check 'dry run prints the protocol registration' ($src -match "Dry 'Register the mousecal:// URL protocol")
 Check 'handler files are never made user-writable (read & execute only for Users)' ($src -match '\*S-1-5-32-545:\(OI\)\(CI\)RX' -and $src -notmatch "S-1-5-32-545:\(OI\)\(CI\)(F|M|W)")
@@ -574,7 +574,7 @@ try {
     function Get-ActiveRotation { param($a, $b) $script:calls.ActiveReads++; if ($script:failReadBack -and $script:calls.ActiveReads -gt 1) { throw 'cannot read' }; if ($script:calls.ActiveReads -gt 1) { return 8.5 }; return 8.0 }
     function Test-RawAccelFilter { return $true }
     function Install-RawAccelDriver { param($d) return $false }
-    function Get-ScheduledTask { param($TaskName, $ErrorAction) return [pscustomobject]@{ TaskName = 'x' } }
+    function Get-ScheduledTask { param($TaskName, $ErrorAction) return [pscustomobject]@{ TaskName = 'x'; Actions = @([pscustomobject]@{ Execute = (Join-Path $AppDir 'writer.exe'); Arguments = '' }) } }
     function Register-ApplyTask { param($s) $script:calls.Register++ }
     function Unregister-ScheduledTask { param($TaskName, $Confirm, $ErrorAction) $script:calls.Unregister++ }
     function Register-ScheduledTask { }
@@ -737,7 +737,7 @@ try {
     # F5: uninstall keeps the task until the driver step succeeded; falls back to a verified uninstaller
     $ZipFilesText = $rows -join "`n"; $ZipSha256 = Get-BytesSha256 $fakeZip
     function Test-RawAccelFilter { return $true }
-    function Get-ScheduledTask { param($TaskName, $ErrorAction) return [pscustomobject]@{ TaskName = 'x' } }
+    function Get-ScheduledTask { param($TaskName, $ErrorAction) return [pscustomobject]@{ TaskName = 'x'; Actions = @([pscustomobject]@{ Execute = (Join-Path $AppDir 'writer.exe'); Arguments = '' }) } }
     function Unregister-ScheduledTask { param($TaskName, $Confirm, $ErrorAction) $script:calls.Unregister++ }
     function New-StageDir { $p = Join-Path $script:InstallRoot '.staging'; New-Item -ItemType Directory $p -Force | Out-Null; return $p }
     function Invoke-DriverTool { param($Exe, $Mode, $TimeoutSec) $script:calls.Tool++; $script:lastTool = $Exe; return @{ Ok = $script:toolOk; Output = 'stub' } }
@@ -753,6 +753,11 @@ try {
     $script:toolOk = $true; $script:calls.Unregister = 0
     $null = Invoke-Uninstall *>&1
     Check 'F5 driver step ok -> task removed afterwards, marker gone' ($script:calls.Unregister -eq 1 -and -not (Test-Path $script:MarkerPath))
+    # panel: a same-named task that is NOT ours is never removed
+    Check 'panel: Test-OwnApplyTask accepts our writer.exe task' (Test-OwnApplyTask ([pscustomobject]@{ Actions = @([pscustomobject]@{ Execute = (Join-Path $AppDir 'writer.exe'); Arguments = '"x"' }) }))
+    Check 'panel: Test-OwnApplyTask accepts the legacy wscript + apply-rawaccel.vbs task' (Test-OwnApplyTask ([pscustomobject]@{ Actions = @([pscustomobject]@{ Execute = 'wscript.exe'; Arguments = ('"' + $VbsPath + '"') }) }))
+    Check 'panel: Test-OwnApplyTask rejects a foreign task with the same name' (-not (Test-OwnApplyTask ([pscustomobject]@{ Actions = @([pscustomobject]@{ Execute = 'C:\Toolsackup.exe'; Arguments = '' }) })))
+    Check 'panel: Test-OwnApplyTask rejects a task with no action' (-not (Test-OwnApplyTask ([pscustomobject]@{ Actions = @() })))
     Check 'F5 intact installed uninstaller is used as is' ($script:lastTool -eq (Join-Path $script:AppDir 'uninstaller.exe'))
     New-Sandbox; [IO.File]::WriteAllText($script:MarkerPath, $oldMarker); [IO.File]::WriteAllText((Join-Path $script:AppDir 'uninstaller.exe'), 'TAMPERED')
     $null = Invoke-Uninstall *>&1
@@ -1126,7 +1131,7 @@ try {
         function Get-ActiveRotation { param($a, $b) if ($script:rotMixed) { Fail 'mixed' 'mixed' @() 3 }; return 8.0 }
         function Test-RawAccelFilter { return $true }
         function Install-RawAccelDriver { param($d) return $false }
-        function Get-ScheduledTask { param($TaskName, $ErrorAction) return [pscustomobject]@{ TaskName = 'x' } }
+        function Get-ScheduledTask { param($TaskName, $ErrorAction) return [pscustomobject]@{ TaskName = 'x'; Actions = @([pscustomobject]@{ Execute = (Join-Path $AppDir 'writer.exe'); Arguments = '' }) } }
         function Register-ApplyTask { param($s) $script:calls.Register++ }
         function Unregister-ScheduledTask { param($TaskName, $Confirm, $ErrorAction) $script:calls.Unregister++ }
         function Register-ScheduledTask { }
