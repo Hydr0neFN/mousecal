@@ -236,3 +236,7 @@ test('README documents the launcher, the hash, the folder and the ClickFix reaso
     assert.ok(r.includes(needle), 'README lacks ' + needle);
   }
 });
+
+test('git stores setup.ps1 byte for byte (.gitattributes -text), otherwise a checkout would not match SETUP_SHA256', () => {
+  assert.match(read('.gitattributes'), /^setup\.ps1 -text\s*$/m);
+});

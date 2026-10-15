@@ -53,7 +53,7 @@ verifies the SHA256 before using it.
 `setup.ps1` is generated so that it stays pure ASCII: Chinese text becomes `\uXXXX` escapes that the script
 decodes at run time. That way it works however the download is decoded (no charset header needed).
 After editing `tools/setup.src.ps1` or `tools/settings.template.json`, run `node tools/build-setup.mjs`. It also
-writes `setup-hash.js`; **always deploy `setup.ps1` and `setup-hash.js` together** (the launcher the page builds
+writes `setup-hash.js`; **always deploy `setup.ps1` and `setup-hash.js` together** (`.gitattributes` marks `setup.ps1` as `-text` so git never changes its line endings; the hash is of the exact bytes) (the launcher the page builds
 refuses to run a `setup.ps1` whose SHA256 differs from `SETUP_SHA256`). `node --test test/*.mjs` fails when the
 committed generated files are stale.
 

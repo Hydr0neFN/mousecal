@@ -1,0 +1,2 @@
+# setup.ps1 is hashed byte for byte (SETUP_SHA256 in setup-hash.js): never let git change its line endings.
+setup.ps1 -text
