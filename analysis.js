@@ -23,7 +23,9 @@ export const DEFAULTS = {
   minStrokes: 15,
   wristWarnDeg: 3,
   stdWarnDeg: 4,
-  smoothWin: null       // null = choose from the median event interval
+  smoothWin: null,      // null = choose from the median event interval
+  dropLast: false,      // drop the final (possibly unfinished) stroke before counting
+  tailMs: 300           // analyzeTimed: samples this close to the end are discarded
 };
 
 function opt(o) {
@@ -195,11 +197,15 @@ function segment(samples, options) {
   chunks.push(cur);
 
   const cand = [];
-  for (const ch of chunks) {
+  for (let ci = 0; ci < chunks.length; ci++) {
+    const ch = chunks[ci];
     const pos = [];
     let p = 0;
     for (const s of ch) { p += s[1] * ca + (-s[2]) * sa; pos.push(p); }
-    for (const [a, b] of zigzag(smooth(pos, win), o.hyst)) {
+    const ranges = zigzag(smooth(pos, win), o.hyst);
+    // the last range of the last chunk is the stroke still in progress when recording stopped
+    if (o.dropLast && ci === chunks.length - 1) ranges.pop();
+    for (const [a, b] of ranges) {
       let sx = 0, sy = 0;
       for (let j = a; j <= b; j++) { sx += ch[j][1]; sy += ch[j][2]; }
       const st = makeStroke(sx, sy, ch[a][0], ch[b][0]);
@@ -296,9 +302,20 @@ export function analyze(samples, options) {
   return res;
 }
 
-// Stroke list from compact [dx, dy] pairs (used for the bundled example).
-export function strokesFromVectors(vecs) {
-  return vecs.map((v) => makeStroke(v[0], v[1]));
+/*
+ * Timed recording: the last moments are unreliable (the hand is already moving to stop).
+ * trimTail drops every sample within `ms` of endT (and anything after endT); same shape in/out.
+ */
+export function trimTail(samples, endT, ms) {
+  if (!samples) return [];
+  const cut = endT - (ms == null ? DEFAULTS.tailMs : ms);
+  return samples.filter((s) => (Array.isArray(s) ? s[0] : s.t) <= cut);
+}
+
+// analyze() for a recording that ended at endT: trims the tail and drops the final partial stroke.
+export function analyzeTimed(samples, endT, options) {
+  const o = Object.assign({}, options, { dropLast: true });
+  return analyze(trimTail(samples, endT, o.tailMs), o);
 }
 
 // ------------------------------------------------------------------ verdict
@@ -326,7 +343,7 @@ export function rawAccelSettings(templateJsonString, theta) {
 const api = {
   DEFAULTS, THRESHOLDS, fold, vecAngle, pcaAngle, median, mean, stdev, quantile, weightedMedianOf,
   smooth, zigzag, segmentStrokes, confidenceLabel, histogram, summarize, analyze,
-  strokesFromVectors, verdict, rawAccelSettings
+  trimTail, analyzeTimed, verdict, rawAccelSettings
 };
 if (typeof window !== 'undefined') globalThis.MouseCalAnalysis = api;
 export default api;

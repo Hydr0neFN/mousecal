@@ -294,3 +294,37 @@ svg text { font-family: var(--font-mono); }
 /* one-click (mousecal://) block above the first-install steps */
 .oneclick { margin: 0 0 22px; padding: 0 0 18px; border-bottom: 1px solid var(--rule-2); }
 .first-title { margin: 0 0 10px; font-size: 18px; }
+
+/* ---- welcome band (returning visitors) ---- */
+.welcome {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px;
+  margin: 24px 0 0; padding: 18px 20px; background: var(--panel); border: 1px solid var(--ink); border-left: 6px solid var(--needle);
+}
+.welcome-text { margin: 0; flex: 1 1 14em; font: 700 20px/1.4 var(--font-sans); }
+.linkbtn {
+  flex: 1 1 100%; justify-self: start; text-align: left; padding: 4px 0; background: none; border: 0; cursor: pointer;
+  font: 400 14px/1.5 var(--font-sans); color: var(--ink-2); text-decoration: underline; text-underline-offset: 3px;
+}
+.linkbtn:hover { color: var(--ink); }
+
+/* ---- fix: manual steps, failed re-check emphasis ---- */
+.manual { margin: 0 0 22px; padding: 14px 0 0; border-top: 1px solid var(--rule-2); }
+.oneclick.hot { padding: 14px; border: 3px solid var(--needle); background: var(--needle-soft); }
+.verdict .btn.big { margin-top: 12px; }
+
+/* ---- sticky re-measure bar ---- */
+.remeasure-bar {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px 16px;
+  padding: 12px max(14px, env(safe-area-inset-right)) calc(12px + env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left));
+  background: var(--panel); border-top: 2px solid var(--needle); box-shadow: 0 -4px 14px rgba(0, 0, 0, 0.18);
+}
+.bar-text { margin: 0; font: 700 18px/1.3 var(--font-sans); }
+body.has-bar { padding-bottom: calc(96px + env(safe-area-inset-bottom)); }
+@media (max-width: 520px) {
+  .remeasure-bar .btn { flex: 1 1 100%; }
+  body.has-bar { padding-bottom: calc(148px + env(safe-area-inset-bottom)); }
+}
+.manual.compact { font-size: 14px; }
+.manual.compact .step-title { font-size: 15px; }
+.manual.compact .btn.big { font-size: 16px; padding: 10px 16px; }

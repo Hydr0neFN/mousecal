@@ -45,7 +45,7 @@ test('both languages have the same keys, and every key used in index.html exists
 });
 
 test('Chinese strings are Traditional (no common Simplified-only characters); English has no CJK', () => {
-  const simplified = /[这个为们测门来时说对问发开关电线级与专东严两丝丢乐习书买乱争亏亚产亲优儿兴养内决况准凉则刚创别动务区医华单卖却厂历县参双变叶号叹启员响围图场坏块处备头夹夺奋妇孙学宁实宝宽对导将层岁带师帮广庆应开张强录总恶惊户执扩扫扬换损摇数断时显晒晚暂书术机杀杂极构样检楼横欢欧步归残毕气汇汉沟没泽测济浅测浓温湾满滤灭灯灵点热爱状犹猪献现环琐电画异盖盘睁码础确离种积称穷窃笔签简类粮紧纠红纪约级细织终组结绝绞统继续绿维缘编缩网罗罚职联聪肃脑脚脏舰艺节获蓝虑补袜见观规视览觉计订认讨让训议讯记讲许论设访证评识诉词译试话该详语误说请读调谁谈谢谱贝负贡财责贤败货质购贯贴贵贸费资赏赔赖赚赛赞赵趋跃踪车轮软轻载轿较辅辆输边迁过运还这进远违连迟选递逻遗邮邻郑释针钉钟钢钥钱铁铃铜银链锁锅错键锻镜长闭问闲间闷队阳阴阶际陆陈险随隐难雾静颗领频题颜风飞饭饮馆马驱验骑鱼鲜鸟麦黄齐齿龙]/;
+  const simplified = /[这个为们测门来时说对问发开关电线级与专东严两丝丢乐习书买乱争亏亚产亲优儿兴养内决况准凉则刚创别动务区医华单卖却厂历县参双变叶号叹启员响围图场坏块处备头夹夺奋妇孙学宁实宝宽对导将层岁带师帮广庆应开张强录总恶惊户执扩扫扬换损摇数断时显晒晚暂书术机杀杂极构样检楼横欢欧归残毕气汇汉沟没泽测济浅测浓温湾满滤灭灯灵点热爱状犹猪献现环琐电画异盖盘睁码础确离种积称穷窃笔签简类粮紧纠红纪约级细织终组结绝绞统继续绿维缘编缩网罗罚职联聪肃脑脚脏舰艺节获蓝虑补袜见观规视览觉计订认讨让训议讯记讲许论设访证评识诉词译试话该详语误说请读调谁谈谢谱贝负贡财责贤败货质购贯贴贵贸费资赏赔赖赚赛赞赵趋跃踪车轮软轻载轿较辅辆输边迁过运还这进远违连迟选递逻遗邮邻郑释针钉钟钢钥钱铁铃铜银链锁锅错键锻镜长闭问闲间闷队阳阴阶际陆陈险随隐难雾静颗领频题颜风飞饭饮馆马驱验骑鱼鲜鸟麦黄齐齿龙]/;
   for (const [k, v] of Object.entries(STRINGS.zh)) assert.ok(!simplified.test(v), `zh.${k} has Simplified characters: ${v}`);
   for (const [k, v] of Object.entries(STRINGS.en).filter(([k]) => k !== 'langBtn')) assert.ok(!/[\u3400-\u9fff]/.test(v), `en.${k} contains CJK`);
 });
@@ -78,10 +78,16 @@ test('shipped files contain no personal names/paths or vendor-specific content',
 
 test('page keeps no record of applied rotation and no "applied" editor (F4)', () => {
   const app = read('app.js'), html = read('index.html');
-  assert.ok(!/S\.applied|S\.pending|inpApplied|applied:/.test(app), 'app.js still tracks applied rotation');
+  assert.ok(!/S\.applied|inpApplied|applied:/.test(app), 'app.js still tracks applied rotation');
   assert.ok(!html.includes('inpApplied'));
   const saved = /localStorage\.setItem\([^)]*JSON\.stringify\(\{([^}]*)\}\)/.exec(app);
-  assert.ok(saved && !/applied|pending|rotation/i.test(saved[1]), 'storage holds: ' + (saved && saved[1]));
+  assert.ok(!saved, 'storage is written through serializeStore only');
+  const st = read('store.js');
+  const ser = /JSON\.stringify\(\{([^}]*)\}\)/.exec(st);
+  assert.ok(ser && !/applied|rotation|theta/i.test(ser[1].replace('pendingApply', '')), 'storage holds: ' + (ser && ser[1]));
+  // the stored record never feeds the rotation that goes into a command or link
+  const m = /function measuredForCommand\(\) \{([\s\S]*?)\n\}/.exec(app);
+  assert.ok(m && !/S\.last|S\.before|localStorage|S\.pendingApply/.test(m[1]), 'measuredForCommand reads stored data');
   assert.ok(!installCommand(8.2).includes('-Rotation'));
   assert.ok(installCommand(-45).length < 259 && installCommand(-45).includes('-Measured -45.0}catch{'));
 });
@@ -142,17 +148,20 @@ test('one-click links have exactly the shapes the handler accepts', () => {
 
 test('page wiring: one-click apply + uninstall buttons, first-install flow kept, blur fallback', () => {
   const html = read('index.html'), app = read('app.js');
-  for (const id of ['btnOneClick', 'oneClickMsg', 'ocUrl', 'btnOneClickUn', 'oneClickUnMsg', 'unUrl', 'btnCopyInstall', 'btnCopyUninstall', 'cmdInstall', 'cmdUninstall']) {
+  for (const id of ['btnApply', 'oneClickMsg', 'ocUrl', 'btnOneClickUn', 'oneClickUnMsg', 'unUrl', 'btnCopyInstall', 'btnCopyUninstall', 'cmdInstall', 'cmdUninstall', 'manualSteps', 'unManual', 'remeasureBar', 'welcome']) {
     assert.ok(html.includes(`id="${id}"`), id);
   }
   assert.ok(/applyUrl\(/.test(app) && /uninstallUrl\(/.test(app));
-  assert.ok(/addEventListener\('blur'/.test(app) && /1500/.test(app), 'no blur/1.5 s fallback');
-  assert.ok(STRINGS.zh.btnOneClick === '一鍵套用（已經安裝過）');
-  assert.ok(STRINGS.zh.firstTitle === '第一次安裝');
-  assert.ok(STRINGS.zh.ocNotInstalled.includes('好像還沒安裝過') && STRINGS.zh.ocNotInstalled.includes('第一次安裝'));
-  assert.ok(STRINGS.zh.btnOneClickUn === '一鍵解除安裝');
-  // the copy-command flow is still there and unchanged
+  // one primary button: copy first, then open the link; nothing branches on blur / visibility
+  assert.ok(!/addEventListener\('blur'|visibilitychange|document\.hidden/.test(app), 'must not branch on blur');
+  const run = /function runLinkAction[\s\S]*?\n\}/.exec(app)[0];
+  assert.ok(run.indexOf('copyQuiet(') > 0 && run.indexOf('copyQuiet(') < run.indexOf('window.location.assign'), 'copy must come before the link');
+  assert.ok(/FALLBACK_DELAY_MS = 3000/.test(app));
+  assert.ok(STRINGS.zh.btnApply === '套用修正' && STRINGS.zh.btnOneClickUn === '解除安裝');
+  assert.ok(!html.includes('id="btnOneClick"') && !('firstTitle' in STRINGS.zh), 'separate first-install / one-click buttons are gone');
+  // the copy-command flow is still there (now under Advanced as "only copy")
   assert.ok(/copyText\(installCommand\(measuredForCommand\(\)\)/.test(app));
+  assert.ok(html.indexOf('id="btnCopyInstall"') > html.indexOf('id="advanced"'));
 });
 
 test('setup.ps1 carries the handler: link validation before any command line, only two actions, confirm, local copy', () => {
@@ -188,4 +197,37 @@ test('README: node test glob, VBScript deprecation + copy-command fallback, per-
   assert.match(r, /copy-command method[\s\S]{0,200}neither the handler nor VBScript/);
   assert.ok(r.includes('%LOCALAPPDATA%\\mousecal\\handler.log') && !r.includes('%ProgramData%\\mousecal'), 'handler log location');
   assert.ok(r.includes('Global\\mousecal-setup') && r.includes('.staging\\<guid>'), 'mutex / staging notes');
+});
+
+test('example result is gone; result / fix stay hidden until a real measurement', () => {
+  const html = read('index.html'), app = read('app.js');
+  assert.ok(!/example/i.test(app) && !/example/i.test(html));
+  assert.ok(!readdirSync(web).includes('example.js'));
+  for (const id of ['result', 'fix', 'advanced']) assert.ok(new RegExp(`id="${id}"[^>]*hidden`).test(html), id);
+  assert.ok(app.includes("for (const id of ['result', 'fix', 'advanced']) $(id).hidden = !has"));
+});
+
+test('instructions no longer mention Esc / Enter; Enter / Space cannot stop a measurement', () => {
+  for (const lang of ['zh', 'en']) {
+    for (const k of ['ms1', 'ms2', 'ms3', 'padHint', 'statusMeasuring', 'statusReady']) {
+      assert.ok(!/Esc|Enter/.test(STRINGS[lang][k]), `${lang}.${k}`);
+    }
+  }
+  assert.ok(!/addEventListener\('keydown', onKey/.test(read('app.js')));
+});
+
+test('user-facing zh text has no math notation like |角度| or <=', () => {
+  for (const [k, v] of Object.entries(STRINGS.zh)) assert.ok(!/\|[^|]*\||≤|<=|≥/.test(v), `zh.${k}: ${v}`);
+});
+
+test('timing: 10 s from the first movement, extension up to 20 s, trimmed analysis', () => {
+  const app = read('app.js');
+  assert.ok(/BASE_MS = 10000/.test(app) && /MAX_MS = 20000/.test(app));
+  assert.ok(/analyzeTimed\(/.test(app));
+});
+
+test('sticky bar respects safe-area insets and the page gets bottom padding', () => {
+  const css = read('style.css');
+  assert.ok(/env\(safe-area-inset-bottom\)/.test(css) && /body\.has-bar\s*\{[^}]*padding-bottom/.test(css));
+  assert.ok(/viewport-fit=cover/.test(read('index.html')));
 });

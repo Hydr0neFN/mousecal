@@ -35,10 +35,10 @@ verifies the SHA256 before using it.
 | --- | --- |
 | `index.html`, `style.css` | The page. Self-contained; only Google Fonts are loaded externally. |
 | `app.js` | Pointer-lock measurement, live trail, result, re-measure, copy buttons. |
-| `analysis.js` | Pure functions (ES module, no DOM): stroke segmentation, statistics, `verdict`, `rawAccelSettings`. |
+| `analysis.js` | Pure functions (ES module, no DOM): stroke segmentation, statistics, `trimTail` / `analyzeTimed` (timed recordings), `verdict`, `rawAccelSettings`. |
+| `store.js` | Pure helpers for the per-browser convenience record (`localStorage`: language, last result, path, pending flag). It is never used to compute a rotation. |
 | `commands.js` | The **one** place the page knows its own address (`SITE_BASE`) and the copied commands. |
 | `i18n.js` | All strings (zh-TW and English). |
-| `example.js` | Precomputed example result (summed stroke vectors of a real capture), shown labelled "example". |
 | `settings-template.js` | Generated: Raw Accel default settings, used by the "Advanced" section. |
 | `setup.ps1` | Generated, ASCII-only installer / uninstaller (see below). |
 | `_headers`, `.assetsignore` | Cloudflare static-assets config. |
@@ -46,8 +46,7 @@ verifies the SHA256 before using it.
 | `tools/settings.template.json` | Raw Accel default `settings.json` (single source for the template). |
 | `tools/zip-files.txt` | SHA256 of every file in `RawAccel_v1.7.1.zip` (embedded into `setup.ps1`). |
 | `tools/build-setup.mjs` | Builds `setup.ps1` and `settings-template.js` from the two files above. |
-| `tools/make-example.mjs` | Regenerates `example.js` from a capture CSV (`t` seconds, `dx`, `dy`, `device`). |
-| `test/` | `analysis.test.mjs`, `site.test.mjs` (node, no dependencies) and `setup.test.ps1`. |
+| `test/` | `analysis.test.mjs`, `store.test.mjs`, `site.test.mjs` (node, no dependencies) and `setup.test.ps1`. |
 
 `setup.ps1` is generated so that it stays pure ASCII: Chinese text becomes `\uXXXX` escapes that the script
 decodes at run time. That way it works however `irm` decodes the download (no charset header needed).

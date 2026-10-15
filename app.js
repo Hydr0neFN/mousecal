@@ -1,46 +1,58 @@
 // mousecal page logic: pointer-lock measurement, result rendering, fix paths.
 import * as A from './analysis.js';
-import { EXAMPLE } from './example.js';
 import { SETTINGS_TEMPLATE } from './settings-template.js';
 import { STRINGS } from './i18n.js';
+import { normalizeStore, serializeStore, verdictPath, shortDate, installedAfter } from './store.js';
 import { installCommand, uninstallCommand, applyUrl, uninstallUrl, formatRotation, ONE_CLICK_MAX } from './commands.js';
 
 const $ = (id) => document.getElementById(id);
-const MAX_SECONDS = 30;
+const BASE_MS = 10000;       // countdown starts on the first movement
+const MAX_MS = 20000;        // hard limit after an auto-extension
 const STORE_KEY = 'mousecal.v1';
 const SVGNS = 'http://www.w3.org/2000/svg';
 
 // ------------------------------------------------------------------ state
 const S = {
   lang: 'zh',
-  result: null,            // { res, source: 'example' | 'measured' }
+  result: null,            // { res, source: 'measured', remeasured } - only real, valid measurements
   mode: 'measure',         // 'measure' | 'remeasure'
-  path: null,              // 'software' | 'physical' while remeasuring
-  before: null,            // { theta } first valid measurement
+  path: null,              // 'software' | 'physical' | null (unknown)
+  before: null,            // { theta } what the re-measure is compared with
+  last: null,              // { theta, se, n, at } last valid measurement (per-browser convenience only)
+  pendingApply: false,     // the user started a fix and has not re-measured yet
+  installed: false,        // a re-measure after an apply passed in this browser once (only softens a hint)
+  attempt: null,           // { n } latest measurement that was too short to count
+  finePointer: true,
   measuring: false,
+  phase: 'idle',           // 'ready' (locked, waiting for movement) | 'run' | 'extend'
+  firstT: 0, endAt: 0, endT: 0, extended: false,
   samples: [],
   trail: [],
   px: 0, py: 0,
   unadjusted: null,        // true / false once a lock was granted
-  deadline: 0,
   viewScale: 0,
   live: null
 };
 let timers = { stop: 0, live: 0, raf: 0 };
 let lockPending = false;
+const REMEASURE_BTNS = ['btnRemeasureWin', 'btnRemeasurePhys', 'btnBar', 'btnWelcome'];
 
 // ---------------------------------------------------------------- storage
+// Per-browser convenience only (welcome-back band, sticky bar). Never used to compute a rotation.
 function load() {
   try {
-    const o = JSON.parse(localStorage.getItem(STORE_KEY) || '{}');
-    if (o.lang === 'en' || o.lang === 'zh') S.lang = o.lang;
-    if (o.before && Number.isFinite(o.before.theta)) S.before = { theta: o.before.theta };
+    const o = normalizeStore(JSON.parse(localStorage.getItem(STORE_KEY) || '{}'));
+    if (o.lang) S.lang = o.lang;
+    S.last = o.last; S.path = o.path; S.pendingApply = o.pendingApply; S.installed = o.installed;
   } catch { /* storage unavailable: run without persistence */ }
 }
 function save() {
   try {
-    localStorage.setItem(STORE_KEY, JSON.stringify({ lang: S.lang, before: S.before }));
+    localStorage.setItem(STORE_KEY, serializeStore({ lang: S.lang, last: S.last, path: S.path, pendingApply: S.pendingApply, installed: S.installed }));
   } catch { /* ignore */ }
+}
+function clearStore() {
+  try { localStorage.removeItem(STORE_KEY); } catch { /* ignore */ }
 }
 
 // ------------------------------------------------------------------- i18n
@@ -56,7 +68,6 @@ function applyI18n() {
   for (const el of document.querySelectorAll('[data-i18n]')) el.textContent = t(el.dataset.i18n, DEFAULT_VARS());
   for (const el of document.querySelectorAll('[data-i18n-html]')) el.innerHTML = t(el.dataset.i18nHtml, DEFAULT_VARS());
   $('langBtn').textContent = t('langBtn');
-  $('hudNeed').textContent = t('hudNeed', { n: A.DEFAULTS.minStrokes });
 }
 
 // --------------------------------------------------------------- formatting
@@ -71,7 +82,7 @@ const reducedMotion = () => window.matchMedia('(prefers-reduced-motion: reduce)'
 
 function theta() { return S.result && S.result.res.median != null ? S.result.res.median : null; }
 function canCopy() {
-  return !!S.result && S.result.source !== 'example' && S.result.res.confidence !== 'insufficient';
+  return !!S.result && S.result.res.median != null;
 }
 // The command carries the MEASURED angle only; setup.ps1 adds it to whatever rotation the driver
 // already applies (it reads that from the driver), so the page keeps no record of applied rotation.
@@ -198,14 +209,12 @@ function renderWedge(th, dim) {
 
 // ------------------------------------------------------------------ result
 function renderResult() {
-  const r = S.result, res = r.res, ex = r.source === 'example';
+  const r = S.result, res = r.res;
   const th = res.median;
-  $('exampleStamp').hidden = !ex;
-  $('exampleNote').hidden = !ex;
   $('rdTheta').textContent = th == null ? '--' : signed(th) + '°';
   $('rdSe').textContent = th == null || res.n < 2 ? '' : '±' + num(res.se) + '°';
   let sentence;
-  if (th == null || res.confidence === 'insufficient' && !ex) sentence = t('sentenceNone');
+  if (th == null || res.confidence === 'insufficient') sentence = t('sentenceNone');
   else if (Math.abs(th) < 0.05) sentence = t('sentenceFlat');
   else sentence = t(th > 0 ? 'sentenceUp' : 'sentenceDown', { a: num(Math.abs(th)) });
   $('rdSentence').textContent = sentence;
@@ -260,11 +269,13 @@ function driverInactive() {
 function renderVerdict() {
   const box = $('verdictBox');
   const r = S.result;
-  const show = S.mode === 'remeasure' && S.path && r.remeasured && r.source !== 'example' && r.res.confidence !== 'insufficient' && r.res.median != null;
+  const show = S.mode === 'remeasure' && r.remeasured && r.res.confidence !== 'insufficient' && r.res.median != null;
   box.hidden = !show;
+  $('oneClick').classList.remove('hot');
   if (!show) return;
-  const th = r.res.median, thr = A.THRESHOLDS[S.path];
-  const ok = A.verdict(th, S.path) === 'pass';
+  const vp = verdictPath(S.path);      // unknown path is held to the stricter (Windows) standard
+  const th = r.res.median, thr = A.THRESHOLDS[vp];
+  const ok = A.verdict(th, vp) === 'pass';
   box.dataset.state = ok ? 'pass' : 'fail';
   const icon = $('verdictIcon');
   icon.replaceChildren(ok
@@ -277,47 +288,47 @@ function renderVerdict() {
   $('driverHint').hidden = !hint;
   const fn = $('failNext');
   fn.hidden = ok || hint;
+  // failed on the Windows path: applying the fix again is the one big next step
+  const again = !ok && !hint && S.path === 'software';
+  $('btnFailApply').hidden = !again;
+  $('btnFailApply').disabled = !canCopy();
+  $('oneClick').classList.toggle('hot', again);
   if (!ok && !hint) {
-    fn.textContent = S.path === 'software'
-      ? t('failNextWin', { r: signed(th) })
-      : t('failNextPhys', { a: num(Math.abs(th)), dir: t(th > 0 ? 'dirCCW' : 'dirCW') });
+    if (S.path === 'physical') fn.textContent = t('failNextPhys', { a: num(Math.abs(th)), dir: t(th > 0 ? 'dirCCW' : 'dirCW') });
+    else fn.textContent = t(S.path === 'software' ? 'failNextWin' : 'failNextAny', { r: signed(th) });
   }
 }
 
 // ---------------------------------------------------------------- fix paths
 function renderFix() {
-  const th = theta(), ex = !S.result || S.result.source === 'example';
+  const th = theta();
   const ok = canCopy();
   const rot = measuredForCommand();
   const cmd = $('cmdInstall');
   cmd.textContent = installCommand(rot);
   cmd.classList.toggle('dim', !ok);
+  $('btnApply').disabled = !ok;
   $('btnCopyInstall').disabled = !ok;
   const note = $('cmdNote');
-  if (ex) note.textContent = t('cmdNoteExample');
-  else if (!ok) note.textContent = t('cmdNoteInsufficient');
+  if (!ok) note.textContent = '';
   else if (Math.abs(th) < 0.5) note.textContent = t('cmdNoteTiny', { r: signed(th) });
   else note.textContent = t('cmdNoteReady', { r: signed(rot) });
   $('cmdUninstall').textContent = uninstallCommand();
 
-  // one-click links (mousecal:// protocol, registered by an earlier install); only the measured angle is in the link
-  const tooBig = ok && Math.abs(Number(formatRotation(rot))) > ONE_CLICK_MAX;
-  const ocOk = ok && !tooBig;
-  $('ocUrl').textContent = ocOk ? applyUrl(rot) : '';
-  $('ocUrl').classList.toggle('dim', !ocOk);
-  $('btnOneClick').disabled = !ocOk;
-  $('ocState').textContent = ocOk ? '' : tooBig ? t('ocTooBig', { r: signed(rot) }) : t(ex ? 'cmdNoteExample' : 'cmdNoteInsufficient');
+  // one-click link (mousecal:// protocol, registered by an earlier install); only the measured angle is in the link
+  const tooBig = ok && !oneClickOk(rot);
+  $('ocUrl').textContent = ok && !tooBig ? applyUrl(rot) : '';
+  $('ocUrl').classList.toggle('dim', !ok || tooBig);
+  $('ocState').textContent = tooBig ? t('ocTooBig', { r: signed(rot) }) : '';
   $('unUrl').textContent = uninstallUrl();
 
   // physical path
   const instr = $('physInstr');
   if (th == null) instr.textContent = t('physInstrNoData');
-  else if (ex) instr.textContent = t('physInstrNoData');
   else if (Math.abs(th) < 0.5) instr.textContent = t('physInstrNone');
   else instr.textContent = t(th > 0 ? 'physInstrCCW' : 'physInstrCW', { a: num(Math.abs(th)) });
-  renderWedge(th, ex);
-  $('btnRemeasureWin').disabled = S.measuring;
-  $('btnRemeasurePhys').disabled = S.measuring;
+  renderWedge(th, false);
+  for (const id of REMEASURE_BTNS) $(id).disabled = S.measuring;
 
   // advanced
   let json = '';
@@ -327,68 +338,140 @@ function renderFix() {
   $('btnDownloadJson').disabled = !ok;
 }
 
+function oneClickOk(rot) {
+  return Math.abs(Number(formatRotation(rot))) <= ONE_CLICK_MAX;
+}
+
 function renderBanner() {
   const b = $('modeBanner');
   b.replaceChildren();
-  if (S.mode !== 'remeasure' || !S.path) { b.hidden = true; return; }
+  if (S.mode !== 'remeasure') { b.hidden = true; return; }
   b.hidden = false;
   const span = document.createElement('span');
-  span.textContent = t(S.path === 'software' ? 'modeReWin' : 'modeRePhys', { thr: A.THRESHOLDS[S.path] }) + ' ';
+  span.textContent = t(S.path === 'software' ? 'modeReWin' : S.path === 'physical' ? 'modeRePhys' : 'modeReAny', { thr: A.THRESHOLDS[verdictPath(S.path)] }) + ' ';
   const back = document.createElement('button');
   back.type = 'button'; back.className = 'btn small ghost'; back.textContent = t('modeBack');
-  back.addEventListener('click', () => { if (S.measuring) return; S.mode = 'measure'; S.path = null; renderAll(); });
+  back.addEventListener('click', () => { if (S.measuring) return; S.mode = 'measure'; S.before = null; renderAll(); });
   b.append(span, back);
+}
+
+function renderWelcome() {
+  const l = S.last, show = !!l && !S.result && !S.measuring;
+  $('welcome').hidden = !show;
+  if (!show) return;
+  const date = shortDate(l.at);
+  $('welcomeText').textContent = t(date ? 'welcomeBack' : 'welcomeBackNoDate', { theta: signed(l.theta), date });
 }
 
 function renderAll() {
   applyI18n();
+  const has = !!S.result;
+  for (const id of ['result', 'fix', 'advanced']) $(id).hidden = !has;
+  renderWelcome();
+  renderBar();
   renderBanner();
-  renderResult();
-  renderFix();
+  if (has) { renderResult(); renderFix(); }
+  else for (const id of REMEASURE_BTNS) $(id).disabled = S.measuring;
   $('accelWarn').hidden = S.unadjusted !== false;
   if (!S.measuring) {
     const r = S.result;
-    $('padStatus').textContent = r && r.source === 'measured'
-      ? (r.res.confidence === 'insufficient' ? t('statusNeedMore', { n: r.res.n, need: A.DEFAULTS.minStrokes }) : t('statusDone', { n: r.res.n }))
-      : t('statusIdle');
-    document.querySelector('.pad-cta').textContent = t(r && r.source === 'measured' ? 'padIdleDone' : 'padIdle');
+    $('padStatus').textContent = S.attempt
+      ? t('statusNeedMore', { n: S.attempt.n, need: A.DEFAULTS.minStrokes })
+      : r ? t('statusDone', { n: r.res.n }) : t('statusIdle');
+    document.querySelector('.pad-cta').textContent = t(r ? 'padIdleDone' : 'padIdle');
   }
   drawPad();
 }
 
-// ----------------------------------------------------- one-click (mousecal://)
-// Opens the protocol link. If the page keeps focus for ~1.5 s (no browser prompt, no app window),
-// the protocol is probably not registered: say so. Only the two links from commands.js are ever opened.
-const ONE_CLICK_WAIT_MS = 1500;
-function openOneClick(url, msgEl, notInstalledKey) {
+// ----------------------------------------------------- mousecal:// links
+// Blur / visibility detection of protocol handlers is unreliable, so nothing branches on it. One click does:
+// (1) copy the command (inside the click, so it is still a user gesture), (2) open the link,
+// (3) show the "press Open / Yes" hint at once, (4) after FALLBACK_DELAY_MS show, and keep showing,
+// the manual steps for the case where nothing happened (not installed yet). Only the two links from
+// commands.js are ever opened.
+const FALLBACK_DELAY_MS = 3000;
+
+function say(msgEl, key, vars) {
   clearTimeout(msgEl._t);
-  msgEl.textContent = '';
-  let left = false;
-  const leave = () => { left = true; };
-  window.addEventListener('blur', leave, { once: true });
-  const vis = () => { if (document.hidden) left = true; };
-  document.addEventListener('visibilitychange', vis);
-  msgEl._t = setTimeout(() => {
-    window.removeEventListener('blur', leave);
-    document.removeEventListener('visibilitychange', vis);
-    if (!left && !document.hidden) msgEl.textContent = t(notInstalledKey);
-  }, ONE_CLICK_WAIT_MS);
+  msgEl.textContent = t(key, vars);
+}
+
+// The user started a fix: remember it (per-browser) so the sticky "measure again" bar can show.
+function markPending(path) {
+  S.path = path;
+  S.pendingApply = true;
+  save();
+  renderBar();
+}
+function renderBar() {
+  const bar = S.pendingApply && !S.measuring;
+  $('remeasureBar').hidden = !bar;
+  document.body.classList.toggle('has-bar', bar);
+}
+
+function showManual(boxId, node, select) {
+  const box = $(boxId);
+  box.hidden = false;
+  box.classList.toggle('compact', S.installed);   // known to work before: smaller, but never hidden
+  if (select && node) selectNode(node);
+  if (box.scrollIntoView) box.scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'nearest' });
+}
+
+function runLinkAction({ url, command, node, msgEl, manualId }) {
+  const box = $(manualId);
+  clearTimeout(box._t);
+  box.hidden = true;
+  const copied = copyQuiet(command, node);      // starts synchronously, inside the click
+  if (!url) {            // no link possible (angle beyond the one-click limit): the copied command is the way
+    msgEl.textContent = '';
+    copied.then((ok) => showManual(manualId, node, !ok));
+    return;
+  }
+  say(msgEl, 'applyPrompt');
+  copied.then((ok) => { if (!ok) say(msgEl, 'copySelected'); });
+  box._t = setTimeout(() => {
+    copied.then((ok) => showManual(manualId, node, !ok));
+  }, FALLBACK_DELAY_MS);
   window.location.assign(url);
 }
 
+function doApply() {
+  if (!canCopy() || S.measuring) return;
+  const rot = measuredForCommand();
+  let url = null;
+  if (oneClickOk(rot)) { try { url = applyUrl(rot); } catch { url = null; } }
+  markPending('software');
+  runLinkAction({ url, command: installCommand(rot), node: $('cmdInstall'), msgEl: $('oneClickMsg'), manualId: 'manualSteps' });
+}
+
+function doUninstall() {
+  if (S.measuring) return;
+  markPending('software');
+  runLinkAction({ url: uninstallUrl(), command: uninstallCommand(), node: $('cmdUninstall'), msgEl: $('oneClickUnMsg'), manualId: 'unManual' });
+}
+
 // -------------------------------------------------------------- copy helper
-async function copyText(text, node, msgEl) {
-  const say = (k) => { msgEl.textContent = t(k); clearTimeout(msgEl._t); msgEl._t = setTimeout(() => { msgEl.textContent = ''; }, 4000); };
-  try {
-    if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); say('copied'); return true; }
-  } catch { /* fall through to selection */ }
+function selectNode(node) {
   try {
     if (node.select) { node.focus(); node.select(); }
     else { const rg = document.createRange(); rg.selectNodeContents(node); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(rg); }
-    if (document.execCommand && document.execCommand('copy')) { say('copied'); return true; }
+    return true;
+  } catch { return false; }
+}
+async function copyQuiet(text, node) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); return true; }
+  } catch { /* fall through to selection */ }
+  try {
+    if (selectNode(node) && document.execCommand && document.execCommand('copy')) return true;
   } catch { /* leave it selected */ }
-  say('copySelected');
   return false;
+}
+async function copyText(text, node, msgEl) {
+  const ok = await copyQuiet(text, node);
+  say(msgEl, ok ? 'copied' : 'copySelected');
+  if (ok) msgEl._t = setTimeout(() => { msgEl.textContent = ''; }, 4000);
+  return ok;
 }
 
 // ---------------------------------------------------------------- pad drawing
@@ -439,6 +522,7 @@ function drawPad() {
       const last = pts[pts.length - 1];
       ctx.beginPath(); ctx.arc(cx + (last.x - mx) * k, cy + (last.y - my) * k, 4, 0, 7); ctx.fill();
     }
+    drawTimer(ctx, w, h, now, { ink, ink2, rule, needle });
   } else if (S.result && S.result.res.strokes.length) {
     // fan of every stroke (flipped to point right so the angle is what you see) + the median line
     const strokes = S.result.res.strokes;
@@ -454,6 +538,38 @@ function drawPad() {
     ctx.beginPath(); ctx.moveTo(cx - Math.cos(m) * L, cy + Math.sin(m) * L); ctx.lineTo(cx + Math.cos(m) * L, cy - Math.sin(m) * L); ctx.stroke();
   }
   ctx.globalAlpha = 1;
+}
+
+// Big countdown + progress bar + live stroke count, drawn inside the canvas while measuring.
+function drawTimer(ctx, w, h, now, c) {
+  const mono = cssVar('--font-mono'), sans = cssVar('--font-sans');
+  const hud = $('hud').offsetHeight || 0;
+  ctx.textAlign = 'center';
+  if (S.phase === 'ready') {
+    ctx.fillStyle = c.ink; ctx.font = `700 ${Math.round(clamp(w * 0.09, 26, 44))}px ${sans}`;
+    ctx.fillText(t('padReady'), w / 2, h * 0.3);
+    ctx.fillStyle = c.ink2; ctx.font = `400 ${Math.round(clamp(w * 0.034, 12, 16))}px ${sans}`;
+    ctx.fillText(t('padReadySub'), w / 2, h * 0.3 + 26);
+    ctx.textAlign = 'start';
+    return;
+  }
+  const left = Math.max(0, S.endAt - now);
+  const winStart = S.extended ? S.firstT + BASE_MS : S.firstT;
+  const frac = clamp((now - winStart) / (S.endAt - winStart), 0, 1);
+  const secs = Math.ceil(left / 1000);
+  const top = hud + 8, fs = Math.round(clamp(w * 0.12, 36, 64));
+  ctx.fillStyle = S.phase === 'extend' ? c.needle : c.ink;
+  ctx.font = `600 ${fs}px ${mono}`;
+  ctx.textBaseline = 'top';
+  ctx.fillText(String(secs), w / 2, top);
+  const bw = w * 0.6, bx = (w - bw) / 2, by = top + fs + 6;
+  ctx.fillStyle = c.rule; ctx.fillRect(bx, by, bw, 6);
+  ctx.fillStyle = c.needle; ctx.fillRect(bx, by, bw * frac, 6);
+  ctx.fillStyle = S.phase === 'extend' ? c.needle : c.ink2;
+  ctx.font = `${S.phase === 'extend' ? 700 : 500} ${Math.round(clamp(w * 0.034, 12, 16))}px ${sans}`;
+  const line = S.phase === 'extend' ? t('padMore') + ' · ' : '';
+  ctx.fillText(line + t('padStrokes', { n: S.liveN || 0, need: A.DEFAULTS.minStrokes }), w / 2, by + 14);
+  ctx.textAlign = 'start'; ctx.textBaseline = 'alphabetic';
 }
 
 function rafLoop() {
@@ -497,20 +613,20 @@ function onLockChange() {
   else if (!locked && S.measuring) endMeasure();
 }
 
+// Locked: show "get ready"; the countdown starts on the FIRST movement (see onMove).
 function beginMeasure() {
   S.measuring = true;
+  S.phase = 'ready'; S.extended = false; S.firstT = 0; S.endAt = 0; S.endT = 0; S.liveN = 0;
   S.samples = []; S.trail = []; S.px = 0; S.py = 0; S.viewScale = 0;
-  S.deadline = performance.now() + MAX_SECONDS * 1000;
+  S.attempt = null;
   document.querySelector('.pad-frame').classList.add('locked');
   $('hud').hidden = false;
-  $('btnDone').disabled = false; $('btnReset').disabled = false;
-  $('btnRemeasureWin').disabled = true; $('btnRemeasurePhys').disabled = true;
-  setStatus(t('statusMeasuring'));
+  $('hudTheta').textContent = '--';
+  for (const id of REMEASURE_BTNS) $(id).disabled = true;
+  renderBar(); renderWelcome();
+  setStatus(t('statusReady'));
   document.addEventListener('mousemove', onMove);
-  document.addEventListener('keydown', onKey, true);
-  timers.stop = setTimeout(() => document.exitPointerLock(), MAX_SECONDS * 1000);
-  timers.live = setInterval(liveUpdate, 250);
-  liveUpdate();
+  timers.live = setInterval(tick, 100);
   rafLoop();
 }
 
@@ -519,79 +635,108 @@ function onMove(e) {
   const dx = e.movementX || 0, dy = e.movementY || 0;
   if (!dx && !dy) return;
   const t0 = e.timeStamp || performance.now();
+  const now = performance.now();
+  if (S.phase === 'ready') {
+    S.phase = 'run'; S.firstT = t0; S.endAt = t0 + BASE_MS;
+    setStatus(t('statusMeasuring'));
+  }
   S.samples.push({ t: t0, dx, dy });
   S.px += dx; S.py += dy;
-  const now = performance.now();
   S.trail.push({ x: S.px, y: S.py, t: now });
   while (S.trail.length && now - S.trail[0].t > 2500) S.trail.shift();
 }
 
-function onKey(e) {
-  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); document.exitPointerLock(); }
+// The recording as it would be scored if it ended at endT (tail trimmed, last partial stroke dropped).
+function scoreAt(endT) {
+  return A.analyzeTimed(S.samples, endT);
 }
 
-function liveUpdate() {
-  if (!S.measuring) return;
-  const left = Math.max(0, Math.ceil((S.deadline - performance.now()) / 1000));
-  $('hudTime').textContent = String(left);
-  const r = A.analyze(S.samples);
-  $('hudStrokes').textContent = String(r.n);
-  $('hudStrokes').style.color = r.n >= A.DEFAULTS.minStrokes ? 'var(--pass)' : '';
+function tick() {
+  if (!S.measuring || S.phase === 'ready') return;
+  const now = performance.now();
+  const r = scoreAt(now);
+  S.liveN = r.n;
   $('hudTheta').textContent = r.n >= 3 ? signed(r.median) + '°' : '--';
   if (S.mode === 'remeasure' && S.path === 'physical' && r.n >= 3) renderWedge(r.median, false);
+  if (now < S.endAt) return;
+  if (!S.extended && r.n < A.DEFAULTS.minStrokes) {
+    // fewer than 15 valid strokes at 10 s: a few more seconds (20 s in total), then stop
+    S.extended = true; S.phase = 'extend'; S.endAt = S.firstT + MAX_MS;
+    setStatus(t('statusExtended'));
+  } else {
+    S.endT = now;
+    document.exitPointerLock();
+  }
 }
 
 function endMeasure() {
   S.measuring = false;
-  clearTimeout(timers.stop); clearInterval(timers.live);
+  clearInterval(timers.live);
   document.removeEventListener('mousemove', onMove);
-  document.removeEventListener('keydown', onKey, true);
   document.querySelector('.pad-frame').classList.remove('locked');
   $('hud').hidden = true;
-  $('btnDone').disabled = true; $('btnReset').disabled = true;
+  const endT = S.endT || performance.now();
+  S.phase = 'idle';
 
-  const res = A.analyze(S.samples);
-  S.result = { res, source: 'measured', remeasured: S.mode === 'remeasure' };
-  if (res.confidence !== 'insufficient') afterValidMeasurement(res);
+  const res = scoreAt(endT);
+  if (res.confidence !== 'insufficient') {
+    const prev = S.last;
+    if (S.mode === 'remeasure' && !S.before && prev) S.before = { theta: prev.theta };
+    const remeasured = S.mode === 'remeasure';
+    S.result = { res, source: 'measured', remeasured };
+    S.attempt = null;
+    S.last = { theta: res.median, se: res.se, n: res.n, at: Date.now() };
+    S.pendingApply = false;
+    S.installed = installedAfter(S.installed, { remeasured, path: S.path, pass: A.verdict(res.median, verdictPath(S.path)) === 'pass' });
+    if (!remeasured) S.before = { theta: res.median };
+  } else {
+    S.attempt = { n: res.n };
+  }
   save();
   renderAll();
+  if (S.attempt) return;
   const target = $('result');
   if (target && target.scrollIntoView) target.scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'start' });
 }
 
-function afterValidMeasurement(res) {
-  const th = res.median;
-  if (S.mode === 'measure') S.before = { theta: th };
-}
-
-function resetMeasure() {
-  if (!S.measuring) return;
-  S.samples = []; S.trail = []; S.viewScale = 0;
-  setStatus(t('statusReset'));
-  liveUpdate();
-}
-
 // --------------------------------------------------------------- remeasure
+// Every "measure again" entry point starts straight away: the click is the user gesture pointer lock needs,
+// and the "get ready" phase waits for the first movement before any clock runs.
 function startRemeasure(path) {
   if (S.measuring) return;
-  S.mode = 'remeasure'; S.path = path;
+  S.mode = 'remeasure';
+  if (path) S.path = path;
   if (S.result) S.result.remeasured = false; // the next measurement is the one that counts
-  renderAll();
+  if (!S.before) {
+    if (S.result) S.before = { theta: S.result.res.median };
+    else if (S.last) S.before = { theta: S.last.theta };
+  }
   const pad = padCanvas();
+  if (S.finePointer) startLock();
+  renderAll();
   pad.scrollIntoView({ behavior: reducedMotion() ? 'auto' : 'smooth', block: 'center' });
   pad.focus({ preventScroll: true });
+}
+
+function restartFresh() {
+  if (S.measuring) return;
+  clearStore();
+  S.last = null; S.path = null; S.pendingApply = false; S.installed = false;
+  S.before = null; S.result = null; S.attempt = null; S.mode = 'measure';
+  renderAll();
 }
 
 // -------------------------------------------------------------------- init
 function init() {
   load();
-  const res = A.summarize(A.strokesFromVectors(EXAMPLE.strokes));
-  S.result = { res, source: 'example' };
+  // a returning visitor goes straight to re-measuring, compared with the last result
+  if (S.last) { S.mode = 'remeasure'; S.before = { theta: S.last.theta }; }
 
   const isWin = /Windows/i.test(navigator.userAgent) || (navigator.userAgentData && navigator.userAgentData.platform === 'Windows');
   $('fix').dataset.first = isWin ? 'win' : 'phys';
 
   const finePointer = !window.matchMedia || window.matchMedia('(any-pointer: fine)').matches;
+  S.finePointer = finePointer;
   $('touchNotice').hidden = finePointer;
   if (!finePointer) padCanvas().setAttribute('aria-disabled', 'true');
   if (typeof padCanvas().requestPointerLock !== 'function') $('noLockNotice').hidden = false;
@@ -601,24 +746,25 @@ function init() {
   pad.addEventListener('keydown', (e) => { if ((e.key === 'Enter' || e.key === ' ') && finePointer && !S.measuring) { e.preventDefault(); startLock(); } });
   document.addEventListener('pointerlockchange', onLockChange);
   document.addEventListener('pointerlockerror', () => { if (!lockPending && !S.measuring) setStatus(t('lockErr', { err: 'pointerlockerror' })); });
-  $('btnDone').addEventListener('click', () => document.exitPointerLock());
-  $('btnReset').addEventListener('click', resetMeasure);
   $('langBtn').addEventListener('click', () => { S.lang = S.lang === 'zh' ? 'en' : 'zh'; save(); renderAll(); });
 
+  $('btnWelcome').addEventListener('click', () => startRemeasure(S.path));
+  $('btnWelcomeReset').addEventListener('click', restartFresh);
+  $('btnBar').addEventListener('click', () => startRemeasure(S.path));
+
+  $('btnApply').addEventListener('click', doApply);
+  $('btnFailApply').addEventListener('click', doApply);
+  $('btnOneClickUn').addEventListener('click', doUninstall);
   $('btnCopyInstall').addEventListener('click', async () => {
     if (!canCopy()) return;
-    await copyText(installCommand(measuredForCommand()), $('cmdInstall'), $('copyInstallMsg'));
+    const ok = await copyText(installCommand(measuredForCommand()), $('cmdInstall'), $('copyInstallMsg'));
+    if (ok) markPending('software'); else showManual('manualSteps', $('cmdInstall'), true);
   });
-  $('btnOneClick').addEventListener('click', () => {
-    if (!canCopy()) return;
-    let url;
-    try { url = applyUrl(measuredForCommand()); } catch { return; }
-    openOneClick(url, $('oneClickMsg'), 'ocNotInstalled');
-  });
-  $('btnOneClickUn').addEventListener('click', () => openOneClick(uninstallUrl(), $('oneClickUnMsg'), 'ocUnNotInstalled'));
   $('btnCopyUninstall').addEventListener('click', async () => {
-    await copyText(uninstallCommand(), $('cmdUninstall'), $('copyUninstallMsg'));
+    const ok = await copyText(uninstallCommand(), $('cmdUninstall'), $('copyUninstallMsg'));
+    if (ok) markPending('software'); else showManual('unManual', $('cmdUninstall'), true);
   });
+  $('btnPickPhys').addEventListener('click', () => { markPending('physical'); say($('physPickMsg'), 'physPicked'); });
   $('btnRemeasureWin').addEventListener('click', () => startRemeasure('software'));
   $('btnRemeasurePhys').addEventListener('click', () => startRemeasure('physical'));
   $('btnCopyJson').addEventListener('click', () => copyText($('jsonOut').value, $('jsonOut'), $('copyJsonMsg')));

@@ -6,7 +6,6 @@ import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import * as A from '../analysis.js';
-import { EXAMPLE } from '../example.js';
 import { SETTINGS_TEMPLATE } from '../settings-template.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -219,11 +218,41 @@ test('real capture: median within 0.3 deg of +8.22', { skip: !existsSync(csv) &&
   }
 });
 
-test('bundled example.js (always runs) agrees with the real capture result', () => {
-  const res = A.summarize(A.strokesFromVectors(EXAMPLE.strokes));
-  assert.equal(res.n, 132);
-  assert.ok(Math.abs(res.median - 8.22) < 0.3, `median ${res.median}`);
-  assert.ok(Math.abs(res.median - EXAMPLE.result.median) < 0.02);
-  assert.ok(Math.abs(res.se - EXAMPLE.result.se) < 0.02);
-  assert.equal(res.confidence, 'high');
+test('trimTail drops samples within 300 ms of the end (and anything after it), keeps the input shape', () => {
+  const s = [{ t: 0, dx: 1, dy: 0 }, { t: 699, dx: 2, dy: 0 }, { t: 700, dx: 3, dy: 0 }, { t: 701, dx: 4, dy: 0 }, { t: 1000, dx: 5, dy: 0 }, { t: 1200, dx: 6, dy: 0 }];
+  assert.deepEqual(A.trimTail(s, 1000).map((x) => x.dx), [1, 2, 3]);   // t <= 700 stays
+  assert.deepEqual(A.trimTail(s, 1000, 0).map((x) => x.dx), [1, 2, 3, 4, 5]);
+  assert.deepEqual(A.trimTail(s, 1000, 1000).map((x) => x.dx), [1]);
+  assert.deepEqual(A.trimTail([[0, 1, 1], [900, 2, 2]], 1000), [[0, 1, 1]]);
+  assert.deepEqual(A.trimTail([], 1000), []);
+  assert.deepEqual(A.trimTail(null, 1000), []);
+  assert.equal(s.length, 6); // input untouched
+});
+
+test('dropLast removes exactly the final stroke, even when it is too short to count', () => {
+  const s = synth({ theta: 5, n: 20, len: 2000, angSd: 0.5, gapMs: 0, seed: 11 });
+  const full = A.analyze(s);
+  const dropped = A.analyze(s, { dropLast: true });
+  assert.equal(dropped.n, full.n - 1);
+  assert.deepEqual(dropped.strokes, full.strokes.slice(0, -1));
+  // a tiny unfinished twitch at the very end is the stroke that gets dropped, not a real one
+  const t1 = s[s.length - 1].t;
+  const twitch = s.concat([1, 2, 3, 4, 5, 6].map((i) => ({ t: t1 + i, dx: 40, dy: 0 })));
+  assert.equal(A.analyze(twitch, { dropLast: true }).n, A.analyze(twitch).n);
+});
+
+test('analyzeTimed = trimTail + dropLast: the stop-key swing at the end cannot skew the result', () => {
+  const good = synth({ theta: 6, n: 30, len: 2000, angSd: 0.8, gapMs: 0, seed: 5 });
+  const end = good[good.length - 1].t;
+  // the hand swings wildly in the last 250 ms (reaching for the stop key)
+  const junk = [];
+  for (let i = 1; i <= 25; i++) junk.push({ t: end + i * 10, dx: 400, dy: 300 });
+  const all = good.concat(junk), endT = end + 260;
+  const timed = A.analyzeTimed(all, endT);
+  assert.ok(Math.abs(timed.median - 6) < 1, 'timed median ' + timed.median);
+  assert.ok(timed.n >= 25 && timed.n <= 30, 'n ' + timed.n);
+  // the unfinished stroke is gone: one fewer than a plain analysis of the trimmed data
+  assert.equal(timed.n, A.analyze(A.trimTail(all, endT)).n - 1);
+  // options pass through
+  assert.equal(A.analyzeTimed(good, end + 300, { minStrokes: 1000 }).confidence, 'insufficient');
 });

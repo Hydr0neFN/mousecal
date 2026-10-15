@@ -2,7 +2,7 @@
 <html lang="zh-Hant-TW">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>滑鼠角度校正 · Mouse angle calibrator</title>
 <meta name="description" content="Measure how many degrees your mouse sensor is rotated and fix it. 量出滑鼠感應器偏了幾度，然後修正。">
 <meta name="color-scheme" content="light dark">
@@ -27,6 +27,13 @@
 </header>
 
 <main>
+
+  <!-- WELCOME BACK (returning visitors only) -->
+  <section class="welcome" id="welcome" aria-label="Welcome back" hidden>
+    <p id="welcomeText" class="welcome-text"></p>
+    <button id="btnWelcome" class="btn big accent" type="button" data-i18n="btnRemeasure"></button>
+    <button id="btnWelcomeReset" class="linkbtn" type="button" data-i18n="welcomeReset"></button>
+  </section>
 
   <!-- 01 MEASURE -->
   <section class="block" id="measure" aria-labelledby="h-measure">
@@ -53,14 +60,10 @@
             <span class="pad-sub" data-i18n="padHint"></span>
           </div>
           <div class="hud" id="hud" aria-hidden="true" hidden>
-            <div class="hud-cell"><span class="hud-k" data-i18n="hudStrokes"></span><span class="hud-v" id="hudStrokes">0</span><span class="hud-s" id="hudNeed"></span></div>
             <div class="hud-cell"><span class="hud-k" data-i18n="hudNow"></span><span class="hud-v" id="hudTheta">--</span></div>
-            <div class="hud-cell"><span class="hud-k" data-i18n="hudTime"></span><span class="hud-v" id="hudTime">30</span></div>
           </div>
         </div>
         <div class="pad-controls">
-          <button id="btnDone" class="btn small" type="button" disabled data-i18n="btnDone"></button>
-          <button id="btnReset" class="btn small ghost" type="button" disabled data-i18n="btnReset"></button>
           <p id="padStatus" class="status" role="status" aria-live="polite"></p>
         </div>
         <p id="accelWarn" class="notice warn" role="note" hidden data-i18n="accelWarn"></p>
@@ -69,8 +72,8 @@
   </section>
 
   <!-- 02 RESULT -->
-  <section class="block" id="result" aria-labelledby="h-result" aria-live="polite">
-    <p class="eyebrow"><span class="idx">02</span> <span id="h-result" data-i18n="secResult"></span> <span id="exampleStamp" class="stamp" hidden data-i18n="exampleStamp"></span></p>
+  <section class="block" id="result" aria-labelledby="h-result" aria-live="polite" hidden>
+    <p class="eyebrow"><span class="idx">02</span> <span id="h-result" data-i18n="secResult"></span></p>
     <div class="result-grid">
       <figure class="dial-fig">
         <svg id="dial" viewBox="0 0 330 300" role="img" aria-label="Angle dial"></svg>
@@ -80,7 +83,6 @@
         <p id="rdSentence" class="sentence"></p>
         <p id="rdConf" class="conf"></p>
         <p id="rdSmall" class="small-note" data-i18n="smallNote"></p>
-        <p id="exampleNote" class="notice" hidden data-i18n="exampleNote"></p>
         <ul id="rdWarnings" class="warnings"></ul>
 
         <div id="verdictBox" class="verdict" hidden>
@@ -100,6 +102,7 @@
             <pre class="cmd small-cmd" id="drvCmd">Get-CimInstance Win32_SystemDriver -Filter "Name='rawaccel'" | Select-Object Name, State</pre>
           </div>
           <p id="failNext" class="fail-next" hidden></p>
+          <button id="btnFailApply" class="btn big accent" type="button" hidden data-i18n="btnApply"></button>
         </div>
 
         <details class="stats">
@@ -115,7 +118,7 @@
   </section>
 
   <!-- 03 FIX -->
-  <section class="block" id="fix" aria-labelledby="h-fix" data-first="win">
+  <section class="block" id="fix" aria-labelledby="h-fix" data-first="win" hidden>
     <p class="eyebrow"><span class="idx">03</span> <span id="h-fix" data-i18n="secFix"></span></p>
     <div class="paths">
 
@@ -127,52 +130,46 @@
         </header>
 
         <div class="oneclick" id="oneClick">
-          <p class="step-title" data-i18n="ocTitle"></p>
-          <button id="btnOneClick" class="btn big accent" type="button" data-i18n="btnOneClick"></button>
+          <button id="btnApply" class="btn big accent" type="button" data-i18n="btnApply"></button>
           <p id="oneClickMsg" class="copy-msg" role="status" aria-live="polite"></p>
           <p id="ocState" class="small-note"></p>
           <p class="small-note" data-i18n="ocNote"></p>
           <p class="small-note" data-i18n="ocUrlLabel"></p>
           <pre id="ocUrl" class="cmd small-cmd" tabindex="0"></pre>
         </div>
-        <h3 class="first-title" data-i18n="firstTitle"></h3>
 
-        <ol class="big-steps">
-          <li>
-            <div class="step-body">
-              <p class="step-title" data-i18n="w1"></p>
-              <button id="btnCopyInstall" class="btn big" type="button" data-i18n="btnCopyInstall"></button>
-              <p id="copyInstallMsg" class="copy-msg" role="status" aria-live="polite"></p>
-              <p id="cmdNote" class="small-note"></p>
-              <pre id="cmdInstall" class="cmd" tabindex="0"></pre>
-            </div>
-          </li>
-          <li>
-            <div class="step-body">
-              <p class="step-title" data-i18n="w2"></p>
-              <p class="keys" aria-label="Win+R, Ctrl+V, Ctrl+Shift+Enter">
-                <span class="keygroup"><kbd>Win</kbd><i>+</i><kbd>R</kbd></span>
-                <i class="arrow" aria-hidden="true">&rarr;</i>
-                <span class="keygroup"><kbd>Ctrl</kbd><i>+</i><kbd>V</kbd></span>
-                <i class="arrow" aria-hidden="true">&rarr;</i>
-                <span class="keygroup"><kbd>Ctrl</kbd><i>+</i><kbd>Shift</kbd><i>+</i><kbd>Enter</kbd></span>
-              </p>
-              <p class="small-note" data-i18n="w2note"></p>
-            </div>
-          </li>
-          <li>
-            <div class="step-body">
-              <p class="step-title" data-i18n-html="w3"></p>
-              <p class="small-note" data-i18n="w3note"></p>
-            </div>
-          </li>
-          <li>
-            <div class="step-body">
-              <p class="step-title" data-i18n="w4"></p>
-              <button id="btnRemeasureWin" class="btn big accent" type="button" data-i18n="btnRemeasure"></button>
-            </div>
-          </li>
-        </ol>
+        <div id="manualSteps" class="manual" hidden>
+          <h3 data-i18n="manualTitle"></h3>
+          <ol class="big-steps">
+            <li>
+              <div class="step-body">
+                <p class="step-title" data-i18n="w2"></p>
+                <p class="keys" aria-label="Win+R, Ctrl+V, Ctrl+Shift+Enter">
+                  <span class="keygroup"><kbd>Win</kbd><i>+</i><kbd>R</kbd></span>
+                  <i class="arrow" aria-hidden="true">&rarr;</i>
+                  <span class="keygroup"><kbd>Ctrl</kbd><i>+</i><kbd>V</kbd></span>
+                  <i class="arrow" aria-hidden="true">&rarr;</i>
+                  <span class="keygroup"><kbd>Ctrl</kbd><i>+</i><kbd>Shift</kbd><i>+</i><kbd>Enter</kbd></span>
+                </p>
+                <p class="small-note" data-i18n="w2note"></p>
+              </div>
+            </li>
+            <li>
+              <div class="step-body">
+                <p class="step-title" data-i18n-html="w3"></p>
+                <p class="small-note" data-i18n="w3note"></p>
+              </div>
+            </li>
+            <li>
+              <div class="step-body">
+                <p class="step-title" data-i18n="w4"></p>
+                <button id="btnRemeasureWin" class="btn big accent" type="button" data-i18n="btnRemeasure"></button>
+              </div>
+            </li>
+          </ol>
+          <p id="cmdNote" class="small-note"></p>
+          <pre id="cmdInstall" class="cmd" tabindex="0"></pre>
+        </div>
 
         <section class="disclose" aria-labelledby="h-disc">
           <h3 id="h-disc" data-i18n="discTitle"></h3>
@@ -201,10 +198,10 @@
           <span id="oneClickUnMsg" class="copy-msg inline" role="status" aria-live="polite"></span>
           <p class="small-note" data-i18n="unOneNote"></p>
           <p class="small-note"><code id="unUrl"></code></p>
-          <button id="btnCopyUninstall" class="btn small ghost" type="button" data-i18n="btnCopyUninstall"></button>
-          <span id="copyUninstallMsg" class="copy-msg inline" role="status" aria-live="polite"></span>
-          <p class="small-note" data-i18n="unHow"></p>
-          <pre id="cmdUninstall" class="cmd small-cmd" tabindex="0"></pre>
+          <div id="unManual" hidden>
+            <p class="small-note" data-i18n="unHow"></p>
+            <pre id="cmdUninstall" class="cmd small-cmd" tabindex="0"></pre>
+          </div>
         </section>
       </article>
 
@@ -224,6 +221,8 @@
             <div class="step-body">
               <p class="step-title" id="physInstr"></p>
               <p class="small-note" data-i18n="p1note"></p>
+              <button id="btnPickPhys" class="btn small" type="button" data-i18n="btnPickPhys"></button>
+              <p id="physPickMsg" class="copy-msg" role="status" aria-live="polite"></p>
             </div>
           </li>
           <li>
@@ -240,7 +239,7 @@
   </section>
 
   <!-- ADVANCED -->
-  <section class="block" id="advanced">
+  <section class="block" id="advanced" hidden>
     <details class="adv">
       <summary data-i18n="advTitle"></summary>
       <div class="adv-body">
@@ -251,12 +250,24 @@
           <button id="btnDownloadJson" class="btn small ghost" type="button" data-i18n="btnDownloadJson"></button>
           <span id="copyJsonMsg" class="copy-msg inline" role="status" aria-live="polite"></span>
         </div>
+        <p class="small-note" data-i18n="advCopyOnly"></p>
+        <div class="adv-actions">
+          <button id="btnCopyInstall" class="btn small ghost" type="button" data-i18n="btnCopyInstall"></button>
+          <span id="copyInstallMsg" class="copy-msg inline" role="status" aria-live="polite"></span>
+          <button id="btnCopyUninstall" class="btn small ghost" type="button" data-i18n="btnCopyUninstall"></button>
+          <span id="copyUninstallMsg" class="copy-msg inline" role="status" aria-live="polite"></span>
+        </div>
         <textarea id="jsonOut" class="json-out" readonly rows="8" spellcheck="false" aria-label="settings.json"></textarea>
       </div>
     </details>
   </section>
 
 </main>
+
+<div id="remeasureBar" class="remeasure-bar" role="region" aria-label="Re-measure" hidden>
+  <p class="bar-text" data-i18n="barAsk"></p>
+  <button id="btnBar" class="btn accent" type="button" data-i18n="btnRemeasure"></button>
+</div>
 
 <footer class="foot">
   <p data-i18n="footPrivacy"></p>
