@@ -167,7 +167,7 @@ test('launcher: cleanup removes links themselves and never follows them', () => 
 test('launcher: WebClient with the system proxy and TLS 1.2, no curl / Invoke-WebRequest / certutil', () => {
   const c = launcherCmd(INSTALL), b = psBlock(c);
   assert.ok(b.includes('New-Object Net.WebClient') && b.includes('[Net.WebRequest]::GetSystemWebProxy()') && b.includes('DefaultCredentials'));
-  assert.ok(b.includes('SecurityProtocol=[Net.SecurityProtocolType]::Tls12'));
+  assert.ok(b.includes('SecurityProtocol=[Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12'));
   assert.ok(b.includes('$w.DownloadFile($env:MC_URL,$f)'));
   assert.ok(!/curl|Invoke-WebRequest|certutil|bitsadmin|DownloadString|irm\b/i.test(c));
   assert.ok(c.includes('set "MC_URL=' + SITE_BASE + '/setup.ps1"'));
