@@ -1430,7 +1430,8 @@ function Test-SameInteractiveUser([string]$CurrentSid = '', [string[]]$ExplorerS
 }
 
 # Install step (real run): turn Enhance pointer precision off, saving the originals in the marker first.
-# Never fatal: a failure here puts the old values back and only costs this one setting.
+# A failure of the setting itself puts the old values back and only costs this one setting; a failure to write the
+# marker before anything changed stops the install (nothing has been changed yet at that point).
 function Disable-PointerPrecisionStep {
     $tx = $script:Tx
     $cur = Get-PointerPrecision
@@ -1571,12 +1572,15 @@ function Invoke-Rollback {
         foreach ($o in $tx.Overwritten) {
             try { Copy-Item -LiteralPath $o.Backup -Destination $o.Dest -Force } catch { $problems.Add('restore ' + $o.Dest + ': ' + $_.Exception.Message) }
         }
+        $pointerRestoreFailed = $false
         if ($tx.PointerChanged -and $tx.PointerBefore) {
-            try { Restore-PointerPrecision $tx.PointerBefore } catch { $problems.Add('pointer precision: ' + $_.Exception.Message) }
+            try { Restore-PointerPrecision $tx.PointerBefore } catch { $pointerRestoreFailed = $true; $problems.Add('pointer precision: ' + $_.Exception.Message) }
         }
-        # the marker: put back exactly what was there before; delete it only if this run created it
+        # the marker: put back exactly what was there before; delete it only if this run created it -- unless the
+        # pointer settings could not be restored: then it is kept, because it holds the only copy of the originals
         try {
-            if ($tx.OrigMarkerBytes) { [IO.File]::WriteAllBytes($MarkerPath, $tx.OrigMarkerBytes) }
+            if ($pointerRestoreFailed) { $problems.Add('the install marker was kept because it holds your original pointer settings: ' + $MarkerPath) }
+            elseif ($tx.OrigMarkerBytes) { [IO.File]::WriteAllBytes($MarkerPath, $tx.OrigMarkerBytes) }
             else { Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction SilentlyContinue }
         } catch { $problems.Add('marker: ' + $_.Exception.Message) }
         if ($tx.AppDirCreated) { Remove-EmptyDirs $AppDir }
@@ -1798,6 +1802,7 @@ function Invoke-Install($Arg) {
     $tx = $script:Tx
     # ownership from an earlier run (only a valid marker counts) is carried forward, never downgraded
     $prior = Read-Marker
+    $script:PriorMarker = $prior
     if ($prior) { $tx.PriorDriver = [bool]$prior.installedDriver; $tx.PriorAppDir = [bool]$prior.createdAppDir }
     if ($prior -and $prior.pointerPrecision) { $tx.PointerPrecision = $prior.pointerPrecision }      # the saved originals are carried forward, never replaced (not even by the "0"s this tool sets)
     if (Test-Path -LiteralPath $MarkerPath -PathType Leaf) { try { $tx.OrigMarkerBytes = [IO.File]::ReadAllBytes($MarkerPath) } catch { } }
@@ -2038,7 +2043,11 @@ function Invoke-Install($Arg) {
 
         # ---- 5c. Windows "Enhance pointer precision" off (measure first); undone by a rollback
         Step 'Mouse pointer precision' '\u6ed1\u9f20\u6307\u6a19\u7cbe\u78ba\u5ea6'
-        Disable-PointerPrecisionStep
+        # only the FIRST install by this tool turns it off; a re-apply (one-click / re-run) never flips it again,
+        # so a user who turned it back on afterwards keeps their choice
+        if ($script:PriorMarker) {
+            Say 'Already installed before: "Enhance pointer precision" is left as it is now.' '\u4e4b\u524d\u5df2\u7d93\u5b89\u88dd\u904e\uff1a\u300c\u589e\u5f37\u6307\u6a19\u7684\u7cbe\u78ba\u5ea6\u300d\u7dad\u6301\u76ee\u524d\u7684\u8a2d\u5b9a\uff0c\u4e0d\u518d\u66f4\u52d5\u3002'
+        } else { Disable-PointerPrecisionStep }
 
         # ---- 6. apply now (never while a listed game runs)
         Write-Host ''

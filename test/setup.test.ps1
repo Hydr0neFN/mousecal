@@ -1528,16 +1528,16 @@ try {
     $script:spiCalls = @()
     $r = Run-Install $mm
     Check 'EPP re-run (already off): the saved originals are kept, never overwritten with 0s' ((-not $r.Threw) -and ([IO.File]::ReadAllText($script:MarkerPath)).Contains($ppJson) -and $script:spiCalls.Count -eq 0 -and (Get-TestMouse) -ceq '0/0/0') ([IO.File]::ReadAllText($script:MarkerPath))
-    Check 'EPP re-run: says it is already off' ($r.Out -match 'already off')
+    Check 'EPP re-run: says it is left as it is (already installed)' ($r.Out -match 'left as it is now')
     # re-run after the user turned it on again with other values: the true original (first saved) stays
     Set-TestMouse '2' '7' '11'
     $r = Run-Install $mm
-    Check 'EPP re-run (turned on again as 2/7/11): turned off again, the FIRST saved original is still in the marker' ((-not $r.Threw) -and (Get-TestMouse) -ceq '0/0/0' -and ([IO.File]::ReadAllText($script:MarkerPath)).Contains($ppJson)) ([IO.File]::ReadAllText($script:MarkerPath))
+    Check 'EPP re-run (user turned it on again as 2/7/11): left ON (the user''s choice), the FIRST saved original is still in the marker' ((-not $r.Threw) -and (Get-TestMouse) -ceq '2/7/11' -and $script:spiCalls.Count -eq 0 -and ([IO.File]::ReadAllText($script:MarkerPath)).Contains($ppJson)) "$(Get-TestMouse) $([IO.File]::ReadAllText($script:MarkerPath))"
     # a rollback of a re-run puts back what that run found (2/7/11), and the old marker bytes
     Set-TestMouse '2' '7' '11'; $script:spiCalls = @()
     $before = [IO.File]::ReadAllText($script:MarkerPath); $script:writerExit = 1
     $r = Run-Install $mm
-    Check 'EPP re-run that fails later: rolled back, registry back to 2/7/11 and applied live as 7,11,2' ($r.Threw -and (Get-TestMouse) -ceq '2/7/11' -and (Get-LastSpi) -ceq '7,11,2') "$($r.Threw) $(Get-TestMouse) $(Get-LastSpi)"
+    Check 'EPP re-run that fails later: rolled back, pointer settings untouched (2/7/11, no SPI call)' ($r.Threw -and (Get-TestMouse) -ceq '2/7/11' -and $script:spiCalls.Count -eq 0) "$($r.Threw) $(Get-TestMouse) spi=$($script:spiCalls.Count)"
     Check 'EPP re-run that fails later: the marker is exactly as before' ([IO.File]::ReadAllText($script:MarkerPath) -ceq $before)
     # first install that fails later: rollback restores the original, marker removed
     Clear-TestMouse; Set-TestMouse '1' '6' '10'; New-Sandbox3; $script:writerExit = 1
