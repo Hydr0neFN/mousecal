@@ -1207,7 +1207,16 @@ try {
     $script:miceIdx = 0
     New-Sandbox3; $script:daSeq = @($false, $false, $true); $script:miceBefore = @{ 'HID\A' = 'OK' }; $script:miceAfterSeq = @(@{})
     $r = Run-Install $mm
-    Check 'N2 flow: an empty post-restart device list is not a regression' (-not $r.Threw -and $script:miceIdx -le 2) "$($r.Code) $($r.Out) idx=$($script:miceIdx)"
+    Check 'R6-1 flow: a post-restart device list that stays EMPTY (one-mouse PC, mouse gone) -> exit 8 after ~30 checks, rolled back' ($r.Threw -and $r.Code -eq 8 -and $script:miceIdx -ge 30 -and -not (Test-Path $script:MarkerPath)) "$($r.Code) $($r.Out) idx=$($script:miceIdx)"
+    $script:miceIdx = 0
+    New-Sandbox3; $script:daSeq = @($false, $false, $true); $script:miceBefore = @{ 'HID\A' = 'OK' }; $script:miceAfterSeq = @(@{}, @{}, @{}, @{ 'HID\A' = 'OK' })
+    $r = Run-Install $mm
+    Check 'R6-1 flow: an empty list for a few seconds, then the mouse is back -> no regression' (-not $r.Threw -and $script:miceIdx -ge 4) "$($r.Code) $($r.Out) idx=$($script:miceIdx)"
+    $script:miceIdx = 0
+    $late = @((1..15 | ForEach-Object { @{} }) + @(@{ 'HID\A' = 'Error' }, @{ 'HID\A' = 'Error' }, @{ 'HID\A' = 'OK' }))
+    New-Sandbox3; $script:daSeq = @($false, $false, $true); $script:miceBefore = @{ 'HID\A' = 'OK' }; $script:miceAfterSeq = $late
+    $r = Run-Install $mm
+    Check 'R6-3 flow: a mouse that reappears after 15 s in a brief Error state gets its own settle window -> no regression' (-not $r.Threw -and $script:miceIdx -ge 18) "$($r.Code) $($r.Out) idx=$($script:miceIdx)"
     $script:miceAfterSeq = @(); $script:miceIdx = 0
     Remove-Item function:Start-Sleep
     $script:MouseSettleSeconds = 0

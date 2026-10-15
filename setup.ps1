@@ -487,8 +487,9 @@ function Set-ExactDacl([string]$Path) {
     $keep = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-32-545')
     $steps = @(
         , @($Path, '/setowner', ('*' + $AclOwnerSid))
-        , @($Path, '/inheritance:r')
-        , @($Path, '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX')
+        # one icacls call: inheritance removal and the grants land together, so an interrupted run can never leave
+        # an empty protected DACL (which would lock SYSTEM out of writer.exe)
+        , @($Path, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX')
     )
     foreach ($st in $steps) {
         $r = Invoke-Icacls $st
@@ -672,6 +673,17 @@ function Clear-StaleStaging {
     }
 }
 
+# Uninstall: staging leftovers of crashed runs must not keep the install root alive (or be reported as foreign
+# files). Locks the root and .staging first (same order as New-StageDir), then clears and removes .staging.
+function Clear-StagingForUninstall {
+    $stg = Join-Path $InstallRoot '.staging'
+    if ($DryRun -or -not (Test-Path -LiteralPath $stg)) { return }
+    if (Test-ReparsePoint $stg) { Fail '{0} is a link (junction/symlink); refusing to use it as the staging folder.' '{0} \u662f\u9023\u7d50\uff08junction\uff0fsymlink\uff09\uff1b\u62d2\u7d55\u628a\u5b83\u7576\u4f5c\u66ab\u5b58\u8cc7\u6599\u593e\u3002' @($stg) 1 }
+    try { Protect-AppDir $InstallRoot -NoRecurse; Set-ExactDacl $stg } catch { Warn 'Could not lock down the staging folder {0}: {1}' '\u7121\u6cd5\u9396\u5b9a\u66ab\u5b58\u8cc7\u6599\u593e {0}\uff1a{1}' @($stg, $_.Exception.Message); return }
+    Clear-StaleStaging
+    if (-not [IO.Directory]::GetFileSystemEntries($stg).Count) { Remove-Item -LiteralPath $stg -Force -ErrorAction SilentlyContinue }
+}
+
 function Save-Download([string]$Url, [string]$Dest) {
     $wc = New-Object Net.WebClient
     try { $wc.DownloadFile($Url, $Dest) } finally { $wc.Dispose() }
@@ -835,13 +847,13 @@ function Get-MouseDeviceStatus {
 }
 
 # Devices that were OK in $Before and are not OK now (devices that were already broken are ignored):
-# Error = still present but not OK; Missing = no longer listed. A missing device only counts when the list now is
-# not empty (an empty list is a failed / racing enumeration, not evidence about any one mouse).
+# Error = still present but not OK; Missing = no longer listed. An empty list counts as every mouse missing:
+# it may be a racing enumeration, so Wait-MouseRecovery keeps polling for $MouseMissingSeconds, but it is never
+# evidence of health (a one-mouse PC whose mouse did not come back must roll back).
 function Get-MouseRegressionDetail($Before) {
     $now = Get-MouseDeviceStatus
     $err = @($Before.Keys | Where-Object { $Before[$_] -eq 'OK' -and $now.ContainsKey($_) -and $now[$_] -ne 'OK' } | Sort-Object)
-    $miss = @()
-    if ($now.Count -gt 0) { $miss = @($Before.Keys | Where-Object { $Before[$_] -eq 'OK' -and -not $now.ContainsKey($_) } | Sort-Object) }
+    $miss = @($Before.Keys | Where-Object { $Before[$_] -eq 'OK' -and -not $now.ContainsKey($_) } | Sort-Object)
     return @{ Error = $err; Missing = $miss }
 }
 function Get-MouseRegressions($Before) {
@@ -853,10 +865,14 @@ function Get-MouseRegressions($Before) {
 # missing ones $MouseMissingSeconds to reappear. Returns the ones still not OK (empty = healthy).
 function Wait-MouseRecovery($Before) {
     $t = 0
+    $errSince = @{}    # device -> second it was first seen in Error (a device that reappears gets its own settle window)
     while ($true) {
         $d = Get-MouseRegressionDetail $Before
         if ($d.Error.Count -eq 0 -and $d.Missing.Count -eq 0) { return @() }
-        if ($d.Error.Count -gt 0 -and $t -ge $MouseSettleSeconds) { break }
+        foreach ($k in @($errSince.Keys)) { if ($d.Error -notcontains $k) { $errSince.Remove($k) } }
+        foreach ($k in $d.Error) { if (-not $errSince.ContainsKey($k)) { $errSince[$k] = $t } }
+        $settled = @($d.Error | Where-Object { ($t - $errSince[$_]) -ge $MouseSettleSeconds })
+        if ($settled.Count -gt 0) { break }
         if ($t -ge $MouseMissingSeconds) { break }
         Start-Sleep -Seconds 1; $t++
     }
@@ -1544,6 +1560,7 @@ function Invoke-Uninstall {
     else {
         Remove-Item -LiteralPath $MarkerPath -Force -ErrorAction SilentlyContinue
         Remove-StageDir
+        Clear-StagingForUninstall
         if ((Test-Path -LiteralPath $InstallRoot) -and (Get-ChildItem -LiteralPath $InstallRoot -Force)) {
             Warn '{0} still holds files this tool did not install, so the folder is left in place.' '{0} \u88e1\u9084\u6709\u4e0d\u662f\u9019\u500b\u5de5\u5177\u5b89\u88dd\u7684\u6a94\u6848\uff0c\u6240\u4ee5\u4fdd\u7559\u8cc7\u6599\u593e\u3002' @($InstallRoot)
         } else { Remove-EmptyDirs $InstallRoot }
