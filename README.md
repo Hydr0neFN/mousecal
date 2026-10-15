@@ -108,7 +108,7 @@ Install, in this order:
    missing, into the admin-only staging folder, and must carry a valid Microsoft signature before it runs).
 3. Downloads `RawAccel_v1.7.1.zip` **into memory**, aborts unless its SHA256 equals
    `770FE3AE0919CA3C4D412F58C985EB27F5434DECAD809F7E8206DE4E8852EEC4`, then extracts it straight from that
-   buffer into `C:\Program Files\RawAccel\.staging` (ACL: Administrators + SYSTEM only). **Every one of the 24
+   buffer into `C:\Program Files\RawAccel\.staging` (exact DACL: only Administrators and SYSTEM can write). **Every one of the 24
    files** is hashed against `tools/zip-files.txt` before it is written; extra, missing or altered files abort
    with exit 4. `driver\rawaccel.sys` must also have a valid Authenticode signature.
 4. Computes the new rotation and generates `settings.json` (existing file: only `"Degrees of rotation"`
@@ -201,11 +201,11 @@ Security limits of the protocol:
 
 Concurrency and permissions: a real run takes the named mutex `Global\mousecal-setup`; a second run exits with
 code 1 ("another mousecal setup is running"). Each run stages in its own `.staging\<guid>` folder and removes only
-that one; stale `.staging\<guid>` folders of crashed runs are deleted at startup (while holding the mutex).
+that one; stale `.staging\<guid>` folders of crashed runs are deleted whatever is inside them (links removed, never followed), right after `.staging` is locked and while holding the mutex. A `.staging` that is itself a link aborts the run (exit 1); `.staging` and each run folder get the same exact DACL.
 `<ProgramFiles>\RawAccel` (the folder itself), `...\RawAccel\RawAccel` and `...\mousecal` get an exact DACL: a fresh
 protected ACL with only SYSTEM full control, Administrators full control and Users read & execute (SIDs; every other
 entry, such as Everyone, a single user or a deny, is removed), owner Administrators; everything below the last two is
-reset to inherit exactly that. The root is locked before `.staging` is created, the app dir before any file is
+reset to inherit exactly that. The root is locked before `.staging` is created (and stays tightened even if setup stops early or is rolled back; this is intended), the app dir before any file is
 copied, and again after `settings.json` is written, even if the folders pre-existed with user write access.
 Junctions / symlinks found inside the app or handler folder are deleted (never followed) before any recursive
 operation; a link as the folder itself aborts the run. Elevated runs only search the Windows and Program Files module

@@ -536,7 +536,7 @@ Check 'install marks the protocol for rollback BEFORE registering it' ($src -mat
 Check 'rollback unregisters the protocol (unless it existed before this run, then it restores the key)' ($src -match '(?s)function Invoke-Rollback.*?ProtocolRegistered.*?-not \$tx\.PriorProtocol\) \{ Unregister-UrlProtocol \}.*?Restore-UrlProtocolSnapshot')
 Check 'uninstall removes the protocol in both branches (marker / no marker)' ((([regex]::Matches($src, 'Remove-UrlProtocolStep')).Count) -ge 3)
 Check 'dry run prints the protocol registration' ($src -match "Dry 'Register the mousecal:// URL protocol")
-Check 'handler files are never made user-writable (read & execute only for Users)' ($src -match "@\('S-1-5-32-545', 'ReadAndExecute'\)" -and $src -notmatch "@\('S-1-5-32-545', '(FullControl|Modify|Write)")
+Check 'handler files are never made user-writable (read & execute only for Users)' ($src -match '\*S-1-5-32-545:\(OI\)\(CI\)RX' -and $src -notmatch "S-1-5-32-545:\(OI\)\(CI\)(F|M|W)")
 Check 'elevation targets only the local copy with -Rotation / -Uninstall' ($src -match "Invoke-Elevated \`$McSetup \`$elevArgs" -and $src -match "'-Rotation', \(Format-Rotation \`$new\), '-NoPause'" -and $src -match "'-Uninstall', '-NoPause'")
 
 # =====================================================================================
@@ -861,9 +861,9 @@ try {
     $c = Show-Calls
     Check 'M1 -NoRecurse: only the folder itself (still the exact DACL)' ($c.Count -eq 1 -and $c[0] -ceq ($fakeApp + ' EXACT-DACL')) ($c -join ' | ')
     Check 'M1 Set-ExactDacl builds a fresh protected ACL: purge every rule, then SYSTEM F, Administrators F, Users RX (SIDs), owner Administrators' (
-        $src -match '(?s)function Set-ExactDacl.*?Get-Acl -LiteralPath.*?SetAccessRuleProtection\(\$true, \$false\).*?RemoveAccessRuleSpecific.*?ContainerInherit, ObjectInherit.*?''S-1-5-18'', ''FullControl''.*?''S-1-5-32-544'', ''FullControl''.*?''S-1-5-32-545'', ''ReadAndExecute''.*?SetOwner.*?Set-Acl -LiteralPath' -and
+        $src -match '(?s)function Set-ExactDacl.*?/setowner.*?/inheritance:r.*?/grant:r.*?\*S-1-5-18:\(OI\)\(CI\)F.*?\*S-1-5-32-544:\(OI\)\(CI\)F.*?\*S-1-5-32-545:\(OI\)\(CI\)RX.*?Get-Acl -LiteralPath.*?/remove:g.*?/remove:d' -and (($src -split 'function Set-ExactDacl')[1] -split 'function Protect-AppDir')[0] -notmatch 'Set-Acl' -and
         $src -match ([regex]::Escape('$AclOwnerSid = ') + "'S-1-5-32-544'"))
-    Check 'M1 no entry ever gives Users more than read & execute' (-not ($src -match "'S-1-5-32-545', '(FullControl|Modify|Write)"))
+    Check 'M1 no entry ever gives Users more than read & execute' (-not ($src -match "S-1-5-32-545:\(OI\)\(CI\)(F|M|W|RW)"))
     function Invoke-Icacls { param([string[]]$IcaclsArgs) return @{ Code = 5; Out = 'Access is denied.' } }
     Check 'F5 a failing icacls aborts with exit 1' ((ThrowsCode { Protect-AppDir $fakeApp }) -eq 1)
     . $applySafety
@@ -1012,11 +1012,13 @@ try {
     # ---- F1/L1: per-run staging folder (root locked + owned first, .staging owned before it is ACL'd)
     $script:InstallRoot = Join-Path $sbRoot 'stg\RawAccel'; $script:Tx = $null
     $script:aclCalls = @(); $script:stagingAtRootLock = $null
-    function Set-ExactDacl { param([string]$Path) $script:aclCalls += , @($Path, 'EXACT-DACL'); $script:stagingAtRootLock = Test-Path -LiteralPath (Join-Path $script:InstallRoot '.staging') }
+    function Set-ExactDacl { param([string]$Path) $script:aclCalls += , @($Path, 'EXACT-DACL'); if ($null -eq $script:stagingAtRootLock) { $script:stagingAtRootLock = Test-Path -LiteralPath (Join-Path $script:InstallRoot '.staging') } }
     $sa = New-StageDir
     $c = Show-Calls
     Check 'L1 the root is locked (exact DACL) before .staging exists' ($c[0] -ceq ($script:InstallRoot + ' EXACT-DACL') -and $script:stagingAtRootLock -eq $false) ($c -join ' | ')
-    Check 'L1 .staging and the run folder: owner Administrators first, then locked to Administrators + SYSTEM' ($c.Count -eq 5 -and $c[1] -ceq ((Split-Path -Parent $sa) + ' /setowner *S-1-5-32-544') -and $c[2] -match '/inheritance:r /grant:r \*S-1-5-32-544:\(OI\)\(CI\)F \*S-1-5-18:\(OI\)\(CI\)F$' -and $c[3] -ceq ($sa + ' /setowner *S-1-5-32-544') -and $c[4] -match '/inheritance:r /grant:r \*S-1-5-32-544:\(OI\)\(CI\)F \*S-1-5-18:\(OI\)\(CI\)F$') ($c -join ' | ')
+    Check 'N1 .staging and the run folder each get the exact DACL (no icacls /grant:r), after the root' ($c.Count -eq 3 -and $c[1] -ceq ((Split-Path -Parent $sa) + ' EXACT-DACL') -and $c[2] -ceq ($sa + ' EXACT-DACL') -and -not (($c -join ' ') -match '/grant')) ($c -join ' | ')
+    Check 'N1 New-StageDir clears stale staging only after the root and .staging are locked, and refuses a .staging link' ($src -match '(?s)function New-StageDir \{.*?Protect-AppDir \$InstallRoot -NoRecurse.*?Test-ReparsePoint \$stg.*?Set-ExactDacl \$stg.*?Clear-StaleStaging.*?Set-ExactDacl \$p' -and $script:staleCalls -ge 1)
+    Check 'N1 the stage functions use no /grant:r' (-not ((($src -split 'function New-StageDir')[1] -split 'function Save-Download')[0] -match '/grant:r'))
     $sb2 = New-StageDir
     Check 'F1 two runs get two different .staging\<guid> folders' ($sa -ne $sb2 -and (Test-Path $sa) -and (Test-Path $sb2) -and (Split-Path -Leaf (Split-Path -Parent $sa)) -eq '.staging' -and (Split-Path -Leaf $sa) -match '^[0-9a-f]{32}$')
     . $applySafety
@@ -1034,12 +1036,29 @@ try {
     [IO.File]::WriteAllText((Join-Path $decoy3 'precious.txt'), 'keep'); [IO.File]::WriteAllText((Join-Path $stg 'aaaa\inner\x.bin'), 'x'); [IO.File]::WriteAllText((Join-Path $stg 'loose.txt'), 'x')
     $null = & cmd.exe /c mklink /J (Join-Path $stg 'bbbb\lnk') $decoy3
     Clear-StaleStaging
-    Check 'L3 every stale .staging\* entry is deleted (and the empty .staging)' (-not (Test-Path -LiteralPath $stg)) ((Get-ChildItem -LiteralPath $stg -Force -ErrorAction SilentlyContinue | ForEach-Object Name) -join ',')
+    Check 'L3 every stale .staging\* entry is deleted, whatever is inside' ((Test-Path -LiteralPath $stg) -and -not @([IO.Directory]::GetFileSystemEntries($stg)).Count) ((Get-ChildItem -LiteralPath $stg -Force -ErrorAction SilentlyContinue | ForEach-Object Name) -join ',')
     Check 'L3 a junction inside a stale folder was not followed' ((Test-Path -LiteralPath (Join-Path $decoy3 'precious.txt')) -and [IO.File]::ReadAllText((Join-Path $decoy3 'precious.txt')) -eq 'keep')
     Clear-StaleStaging
     Check 'L3 nothing to clean is fine' (-not (Throws { Clear-StaleStaging }))
+    # N1: a .staging that is itself a junction is refused (exit 1) and nothing behind it is touched
+    Remove-Item -LiteralPath $stg -Force -Recurse
+    New-Item -ItemType Directory -Path (Join-Path $decoy3 'victim') -Force | Out-Null
+    $null = & cmd.exe /c mklink /J $stg $decoy3
+    $script:aclCalls = @(); $script:Tx = $null
+    $thrown = $null; try { [void](New-StageDir) } catch { $thrown = $_ }
+    Check 'N1 New-StageDir refuses a .staging junction (exit 1), changes no ACL on it and deletes nothing behind it' ($thrown -and $thrown.Exception.Data['ExitCode'] -eq 1 -and (Test-Path -LiteralPath (Join-Path $decoy3 'victim')) -and -not (($script:aclCalls | ForEach-Object { $_ -join ' ' }) -match '\.staging')) "$thrown"
+    $thrown = $null; try { Clear-StaleStaging } catch { $thrown = $_ }
+    Check 'N1 Clear-StaleStaging refuses a .staging junction too' ($thrown -and (Test-Path -LiteralPath (Join-Path $decoy3 'precious.txt')) -and (Test-Path -LiteralPath (Join-Path $decoy3 'victim')))
+    [IO.Directory]::Delete($stg, $false)
+    Check 'N1 ... removing the junction left its target alone' ((Test-Path -LiteralPath (Join-Path $decoy3 'precious.txt')) -and -not (Test-Path -LiteralPath $stg))
+    # S-a: Remove-StageDir removes links inside the run folder without following them
+    $rs = Join-Path $stg 'cccc'; New-Item -ItemType Directory -Path (Join-Path $rs 'sub') -Force | Out-Null
+    $null = & cmd.exe /c mklink /J (Join-Path $rs 'sub\lnk') $decoy3
+    $script:StageDir = $rs; Remove-StageDir; $script:StageDir = $null
+    Check 'S-a Remove-StageDir deletes a junction inside without following it, then the folder and the empty .staging' (-not (Test-Path -LiteralPath $rs) -and -not (Test-Path -LiteralPath $stg) -and (Test-Path -LiteralPath (Join-Path $decoy3 'precious.txt')))
+    Check 'S-a the only recursive file delete left is inside Remove-TreeSafe (links removed first)' (([regex]::Matches($src, 'Remove-Item -LiteralPath \$(?!Key)[^\r\n]*-Recurse')).Count -eq 1)
     . $applySafety
-    Check 'L3 main cleans stale staging under the mutex, before install / uninstall, never for -DryRun' ($src -match '(?s)\$script:SetupLock = Enter-SetupLock.*?if \(-not \$DryRun\) \{ Clear-StaleStaging \}.*?if \(\$arg\.Kind -eq ''Uninstall''\) \{ Invoke-Uninstall')
+    Check 'N1 main no longer calls Clear-StaleStaging itself (New-StageDir does, after the lock; never for -DryRun)' (-not (($src -split 'function Invoke-Main')[1] -match 'Clear-StaleStaging') -and $src -match '(?s)function New-StageDir \{.*?if \(\$DryRun\) \{ New-Item[^\n]*return \$p \}')
 
     # ---- F4 / F7 / hidden elevation: handler.ps1 and handler.vbs
     $hd = Join-Path $sbRoot 'hnd'; New-Item -ItemType Directory -Path $hd | Out-Null
@@ -1162,15 +1181,33 @@ try {
     New-Sandbox3; $script:daSeq = @($false, $false, $true); $script:miceBefore = @{ 'HID\A' = 'OK'; 'HID\B' = 'Error' }; $script:miceAfter = @{ 'HID\A' = 'OK'; 'HID\B' = 'Error' }
     $r = Run-Install $mm
     Check 'F6 flow: a mouse that was already broken is ignored' (-not $r.Threw) "$($r.Code) $($r.Out)"
-    New-Sandbox3; $script:daSeq = @($false, $false, $true); $script:miceBefore = @{ 'HID\A' = 'OK' }; $script:miceAfter = @{}
+    New-Sandbox3; $script:daSeq = @($false, $false, $true); $script:miceBefore = @{ 'HID\A' = 'OK' }; $script:miceAfter = @{ 'HID\C' = 'OK' }; $script:MouseMissingSeconds = 0
     $r = Run-Install $mm
     Check 'S6 flow: a mouse that was OK and is missing after the restart (and stays missing) -> regression, exit 8, rolled back' ($r.Threw -and $r.Code -eq 8 -and $r.Out -match 'HID\\A' -and -not (Test-Path $script:MarkerPath)) "$($r.Code) $($r.Out)"
     # ... but one that reappears within the settle time is fine (devices re-enumerate after a restart)
     function Start-Sleep { param($Seconds, $Milliseconds) }
-    $script:MouseSettleSeconds = 10; $script:miceIdx = 0
-    New-Sandbox3; $script:daSeq = @($false, $false, $true); $script:miceBefore = @{ 'HID\A' = 'OK' }; $script:miceAfterSeq = @(@{}, @{}, @{}, @{ 'HID\A' = 'OK' })
+    $script:MouseSettleSeconds = 10; $script:MouseMissingSeconds = 30; $script:miceIdx = 0
+    $oth = @{ 'HID\C' = 'OK' }
+    New-Sandbox3; $script:daSeq = @($false, $false, $true); $script:miceBefore = @{ 'HID\A' = 'OK' }; $script:miceAfterSeq = @($oth, $oth, $oth, @{ 'HID\A' = 'OK' })
     $r = Run-Install $mm
     Check 'S6 flow: a mouse missing at first but back within the settle time -> no regression' (-not $r.Threw -and $script:miceIdx -ge 4) "$($r.Code) $($r.Out) idx=$($script:miceIdx)"
+    # N2: a missing (not Error) mouse gets 30 s, longer than the 10 s of an Error one
+    $script:miceIdx = 0
+    New-Sandbox3; $script:daSeq = @($false, $false, $true); $script:miceBefore = @{ 'HID\A' = 'OK' }; $script:miceAfterSeq = @((1..24 | ForEach-Object { $oth }) + @(@{ 'HID\A' = 'OK' }))
+    $r = Run-Install $mm
+    Check 'N2 flow: a mouse missing for ~24 s and then back -> no regression' (-not $r.Threw -and $script:miceIdx -ge 25) "$($r.Code) $($r.Out) idx=$($script:miceIdx)"
+    $script:miceIdx = 0
+    New-Sandbox3; $script:daSeq = @($false, $false, $true); $script:miceBefore = @{ 'HID\A' = 'OK' }; $script:miceAfterSeq = @($oth)
+    $r = Run-Install $mm
+    Check 'N2 flow: a mouse that stays missing for the whole 30 s -> exit 8 (after ~30 checks)' ($r.Threw -and $r.Code -eq 8 -and $script:miceIdx -ge 30 -and $script:miceIdx -le 33) "$($r.Code) $($r.Out) idx=$($script:miceIdx)"
+    $script:miceIdx = 0
+    New-Sandbox3; $script:daSeq = @($false, $false, $true); $script:miceBefore = @{ 'HID\A' = 'OK' }; $script:miceAfterSeq = @(@{ 'HID\A' = 'Error' })
+    $r = Run-Install $mm
+    Check 'N2 flow: an Error mouse keeps the 10 s limit -> exit 8 after ~10 checks' ($r.Threw -and $r.Code -eq 8 -and $script:miceIdx -ge 10 -and $script:miceIdx -le 13) "$($r.Code) $($r.Out) idx=$($script:miceIdx)"
+    $script:miceIdx = 0
+    New-Sandbox3; $script:daSeq = @($false, $false, $true); $script:miceBefore = @{ 'HID\A' = 'OK' }; $script:miceAfterSeq = @(@{})
+    $r = Run-Install $mm
+    Check 'N2 flow: an empty post-restart device list is not a regression' (-not $r.Threw -and $script:miceIdx -le 2) "$($r.Code) $($r.Out) idx=$($script:miceIdx)"
     $script:miceAfterSeq = @(); $script:miceIdx = 0
     Remove-Item function:Start-Sleep
     $script:MouseSettleSeconds = 0
@@ -1249,17 +1286,23 @@ try {
     $r = Run-Install $mm
     Check 'S1 a writer.exe that finishes in time: no kill, success' (-not $r.Threw -and $script:killed -eq 0) "$($r.Code) $($r.Out)"
     Remove-TestKey
-    Check 'S1 every other child we wait on is bounded: VC++ redist 10 min, validator / rotation reader 60 s, pnputil 30 s' ($src -match 'Wait-ChildProcess \$p 600' -and $src -match 'Invoke-BoundedProcess \$ps51 \$a 60' -and $src -match 'pnputil\.exe.*?\$WriterTimeoutSec' -and (($src -split 'function Invoke-Install\(')[1] -notmatch '-Wait') -and $src -match '\$WriterTimeoutSec = 30')
+    Check 'S1 every other child we wait on is bounded: VC++ redist 10 min, validator / rotation reader are local helpers run with the call operator, pnputil 30 s' ($src -match 'Wait-ChildProcess \$p 600' -and $src -match '& \$ps51 @a' -and $src -match 'pnputil\.exe.*?\$WriterTimeoutSec' -and (($src -split 'function Invoke-Install\(')[1] -notmatch '-Wait') -and $src -match '\$WriterTimeoutSec = 30')
+    Check 'H1 setup.ps1 starts no process through .NET (only Start-Process / the call operator)' (-not ($src -match '(?i)Diagnostics\.Process\]::Start|ProcessStartInfo|ShellExecute'))
+    $mockSP = Get-Command Start-Process -CommandType Function -ErrorAction SilentlyContinue
+    if ($mockSP) { $mockSPBody = $mockSP.ScriptBlock; Remove-Item function:Start-Process }
     $t0 = Get-Date
-    $bp = Invoke-BoundedProcess (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') @('-NoProfile', '-Command', 'Start-Sleep -Seconds 60') 2
+    $bp = Invoke-BoundedProcess (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') @('-NoProfile', '-Command', 'Start-Sleep -Seconds 60') 2 $sbRoot
     $el = ((Get-Date) - $t0).TotalSeconds
     Check 'S1 Invoke-BoundedProcess kills a hanging child after the limit' ($bp.TimedOut -and $bp.Code -eq 124 -and $el -lt 15) "el=$el"
-    $bp = Invoke-BoundedProcess (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') @('-NoProfile', '-Command', 'Write-Output hello; exit 3') 60
+    $bp = Invoke-BoundedProcess (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') @('-NoProfile', '-Command', 'Write-Output hello; exit 3') 60 $sbRoot
     Check 'S1 Invoke-BoundedProcess returns exit code and output of a child that finishes' (-not $bp.TimedOut -and $bp.Code -eq 3 -and $bp.Out -eq 'hello') "$($bp.Code) [$($bp.Out)]"
 
     $argProbe = Join-Path $sbRoot 'argprobe.ps1'; [IO.File]::WriteAllText($argProbe, 'Write-Output $args[0]; Write-Output $args[1]')
-    $bp = Invoke-BoundedProcess (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') @('-NoProfile', '-File', $argProbe, 'C:\some dir\', 'a "q" b') 60
+    $bp = Invoke-BoundedProcess (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') @('-NoProfile', '-File', $argProbe, 'C:\some dir\', 'a "q" b') 60 $sbRoot
     Check 'S1 Invoke-BoundedProcess passes arguments with spaces, quotes and a trailing backslash intact' (($bp.Out -split "`r?`n")[0] -ceq 'C:\some dir\' -and ($bp.Out -split "`r?`n")[1] -ceq 'a "q" b') $bp.Out
+
+    Check 'H1 Invoke-BoundedProcess leaves no output files behind' (-not @(Get-ChildItem -LiteralPath $sbRoot -Filter 'bp-*' -Force).Count)
+    if ($mockSP) { Set-Item function:Start-Process $mockSPBody }
 
     # ---- L4: the protocol key restore keeps the original value kinds
     $kindKey = $testKey + '-kind'

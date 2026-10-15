@@ -63,6 +63,7 @@ $DriverSysPath = Join-Path $env:SystemRoot 'System32\drivers\rawaccel.sys'
 $ProtocolKey  = 'HKLM:\SOFTWARE\Classes\mousecal'                   # the mousecal:// URL protocol (one-click apply / uninstall)
 $script:StageDir     = $null
 $SetupMutexName = 'Global\mousecal-setup'                              # one real (non -DryRun) run at a time
+$MouseMissingSeconds = 30                                             # a mouse that is missing (not just in Error) after the restart may take this long to reappear
 $MouseSettleSeconds = 10                                              # how long a restarted mouse may take to come back (health check)
 $AclOwnerSid = 'S-1-5-32-544'                                          # owner of everything we lock down (Administrators)
 $WriterTimeoutSec = 30                                                # writer.exe (and other short helpers) may run this long
@@ -478,24 +479,45 @@ function Remove-ReparsePoints([string]$Dir) {
 }
 
 # Replaces the DACL of one folder with exactly: SYSTEM F, Administrators F, Users RX (all container+object
-# inherit), protected, no other entry of any kind (explicit entries are removed one by one, inherited ones are
-# dropped by the protection), owner Administrators. SIDs only, so it works on any Windows language.
+# inherit), protected, no other entry of any kind, owner Administrators. SIDs only, so it works on any Windows
+# language. Writes go through icacls only: owner, inheritance removed, the three grants (/grant:r), then the DACL is
+# READ (Get-Acl) and every other SID found in it (allow or deny, resolvable or not) is removed with /remove:g and
+# /remove:d (a SID that maps to no account, which icacls cannot match, is removed through the ACL object instead).
 function Set-ExactDacl([string]$Path) {
-    $acl = Get-Acl -LiteralPath $Path
-    $acl.SetAccessRuleProtection($true, $false)
-    foreach ($r in @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))) { [void]$acl.RemoveAccessRuleSpecific($r) }
-    $inh = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
-    $none = [Security.AccessControl.PropagationFlags]::None
-    $allow = [Security.AccessControl.AccessControlType]::Allow
-    foreach ($e in @(@('S-1-5-18', 'FullControl'), @('S-1-5-32-544', 'FullControl'), @('S-1-5-32-545', 'ReadAndExecute'))) {
-        $sid = New-Object Security.Principal.SecurityIdentifier($e[0])
-        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($sid, [Security.AccessControl.FileSystemRights]$e[1], $inh, $none, $allow)))
+    $keep = @('S-1-5-18', 'S-1-5-32-544', 'S-1-5-32-545')
+    $steps = @(
+        , @($Path, '/setowner', ('*' + $AclOwnerSid))
+        , @($Path, '/inheritance:r')
+        , @($Path, '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX')
+    )
+    foreach ($st in $steps) {
+        $r = Invoke-Icacls $st
+        if ($r.Code -ne 0) { throw ('icacls ' + ($st[1]) + ' failed: ' + $r.Out) }
     }
-    $owner = New-Object Security.Principal.SecurityIdentifier($AclOwnerSid)
-    $cur = $null
-    try { $cur = $acl.GetOwner([Security.Principal.SecurityIdentifier]) } catch { }
-    if (-not $cur -or $cur.Value -ne $owner.Value) { $acl.SetOwner($owner) }
-    Set-Acl -LiteralPath $Path -AclObject $acl
+    $others = @((Get-Acl -LiteralPath $Path).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) |
+            ForEach-Object { $_.IdentityReference.Value } | Where-Object { $keep -notcontains $_ } | Sort-Object -Unique)
+    $stuck = @()
+    foreach ($sid in $others) {
+        $bad = $false
+        foreach ($flag in '/remove:g', '/remove:d') {
+            $r = Invoke-Icacls @($Path, $flag, ('*' + $sid))
+            if ($r.Code -ne 0) { $bad = $true }
+        }
+        if ($bad) { $stuck += $sid }
+    }
+    # icacls cannot match a SID that maps to no account (orphaned / foreign-domain, error 1332): only those few are
+    # removed through the ACL object, so the result is still exactly the three SIDs
+    if ($stuck.Count -gt 0) {
+        # DACL section only (the ACL cmdlet would also write the SACL, which needs SeSecurityPrivilege)
+        $di = New-Object IO.DirectoryInfo($Path)
+        $sec = [Security.AccessControl.AccessControlSections]::Access
+        $ext = $null -eq $di.PSObject.Methods['GetAccessControl']
+        $acl = if ($ext) { [IO.FileSystemAclExtensions]::GetAccessControl($di, $sec) } else { $di.GetAccessControl($sec) }
+        foreach ($r in @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))) {
+            if ($stuck -contains $r.IdentityReference.Value) { [void]$acl.RemoveAccessRuleSpecific($r) }
+        }
+        if ($ext) { [IO.FileSystemAclExtensions]::SetAccessControl($di, $acl) } else { $di.SetAccessControl($acl) }
+    }
 }
 
 # Locks a folder to EXACTLY: SYSTEM + Administrators full control, Users read & execute only, inheritance
@@ -520,23 +542,36 @@ function Protect-AppDir([string]$Dir, [switch]$NoRecurse) {
     }
 }
 
-# Runs a program with a hard time limit and captures its output (stdout + stderr). On timeout the process
-# is killed. Returns @{ Code; Out; TimedOut }.
-function Invoke-BoundedProcess([string]$File, [string[]]$ProcArgs, [int]$TimeoutSec) {
-    $psi = New-Object Diagnostics.ProcessStartInfo
-    $psi.FileName = $File
-    $psi.Arguments = (@($ProcArgs | ForEach-Object { '"' + (([string]$_).Replace('"', '\"') -replace '(\\+)$', '$1$1') + '"' }) -join ' ')
-    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
-    $p = [Diagnostics.Process]::Start($psi)
+# Runs a program with a hard time limit and captures its output (stdout + stderr). Only Start-Process is used
+# to start it (hidden, output redirected to files in $OutDir, which must be an admin-only folder for real
+# runs; default: this run's staging folder). On timeout the process is killed. Returns @{ Code; Out; TimedOut }.
+function Invoke-BoundedProcess([string]$File, [string[]]$ProcArgs, [int]$TimeoutSec, [string]$OutDir) {
+    if (-not $OutDir) { $OutDir = $script:StageDir }
+    if (-not $OutDir -or -not (Test-Path -LiteralPath $OutDir -PathType Container)) { $OutDir = [IO.Path]::GetTempPath() }
+    $tag = [guid]::NewGuid().ToString('N')
+    $of = Join-Path $OutDir ('bp-' + $tag + '.out')
+    $ef = Join-Path $OutDir ('bp-' + $tag + '.err')
+    $sp = @{ FilePath = $File; WindowStyle = 'Hidden'; PassThru = $true; RedirectStandardOutput = $of; RedirectStandardError = $ef }
+    if ($ProcArgs -and $ProcArgs.Count -gt 0) {
+        $sp.ArgumentList = (@($ProcArgs | ForEach-Object { '"' + (([string]$_).Replace('"', '\"') -replace '(\\+)$', '$1$1') + '"' }) -join ' ')
+    }
+    $p = $null
     try {
-        $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
+        $p = Start-Process @sp
+        try { [void]$p.Handle } catch { }     # keeps the handle so ExitCode is readable after the exit
         if (-not $p.WaitForExit($TimeoutSec * 1000)) {
             try { $p.Kill() } catch { }
+            try { [void]$p.WaitForExit(5000) } catch { }
             return @{ Code = 124; Out = ('timed out after {0} s' -f $TimeoutSec); TimedOut = $true }
         }
         $p.WaitForExit()
-        return @{ Code = $p.ExitCode; Out = (($o.Result + $e.Result).Trim()); TimedOut = $false }
-    } finally { $p.Dispose() }
+        $code = $p.ExitCode
+        if ($null -eq $code) { $code = 0 }
+        return @{ Code = [int]$code; Out = ((Read-SharedText $of) + (Read-SharedText $ef)).Trim(); TimedOut = $false }
+    } finally {
+        if ($p) { try { $p.Dispose() } catch { } }
+        foreach ($x in $of, $ef) { Remove-Item -LiteralPath $x -Force -ErrorAction SilentlyContinue }
+    }
 }
 
 # Waits at most $TimeoutSec for a started process; kills it when it is still running. $true = it exited by itself.
@@ -572,55 +607,69 @@ function Get-StagePath {
     return (Join-Path (Join-Path $InstallRoot '.staging') ([guid]::NewGuid().ToString('N')))
 }
 
+# Deletes a file, a link (the link only, never its target) or a whole folder tree: every reparse point (junction /
+# symlink) inside is removed first (never followed), then the rest is deleted.
+function Remove-TreeSafe([string]$Path) {
+    $a = $null
+    try { $a = [IO.File]::GetAttributes($Path) } catch { return }          # not there
+    $isDir = (($a -band [IO.FileAttributes]::Directory) -ne 0)
+    if (($a -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        if ($isDir) { [IO.Directory]::Delete($Path, $false) } else { [IO.File]::Delete($Path) }
+        return
+    }
+    if (-not $isDir) { [IO.File]::Delete($Path); return }
+    [void](Remove-ReparsePoints $Path)
+    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+}
+
 function New-StageDir {
     $p = Get-StagePath
-    if (-not $DryRun) {
-        if (-not (Test-Path -LiteralPath $InstallRoot)) {
-            New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
-            if ($script:Tx) { $script:Tx.RootCreated = $true }
-        }
-        # the root is locked (exact DACL, owner Administrators) BEFORE .staging is created inside it
-        Protect-AppDir $InstallRoot -NoRecurse
+    if ($DryRun) { New-Item -ItemType Directory -Path $p -Force | Out-Null; return $p }
+    if (-not (Test-Path -LiteralPath $InstallRoot)) {
+        New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
+        if ($script:Tx) { $script:Tx.RootCreated = $true }
     }
+    # the root is locked (exact DACL, owner Administrators) BEFORE .staging is touched inside it
+    Protect-AppDir $InstallRoot -NoRecurse
+    $stg = Split-Path -Parent $p
+    if (Test-ReparsePoint $stg) { Fail '{0} is a link (junction/symlink); refusing to use it as the staging folder.' '{0} \u662f\u9023\u7d50\uff08junction\uff0fsymlink\uff09\uff1b\u62d2\u7d55\u628a\u5b83\u7576\u4f5c\u66ab\u5b58\u8cc7\u6599\u593e\u3002' @($stg) 1 }
+    if (-not (Test-Path -LiteralPath $stg)) { New-Item -ItemType Directory -Path $stg -Force | Out-Null }
+    try { Set-ExactDacl $stg } catch { Fail 'Could not lock down the staging folder {0}: {1}' '\u7121\u6cd5\u9396\u5b9a\u66ab\u5b58\u8cc7\u6599\u593e {0}\uff1a{1}' @($stg, $_.Exception.Message) 1 }
+    Clear-StaleStaging      # leftovers of crashed runs; only after the lock, and we hold the mutex, so none is in use
     New-Item -ItemType Directory -Path $p -Force | Out-Null
-    if (-not $DryRun) {
-        foreach ($d in (Split-Path -Parent $p), $p) {
-            # owner first, then the ACL
-            $r = Invoke-Icacls @($d, '/setowner', ('*' + $AclOwnerSid))
-            if ($r.Code -ne 0) { Fail 'Could not take ownership of the staging folder {0}: {1}' '\u7121\u6cd5\u53d6\u5f97\u66ab\u5b58\u8cc7\u6599\u593e {0} \u7684\u64c1\u6709\u6b0a\uff1a{1}' @($d, $r.Out) 1 }
-            $r = Invoke-Icacls @($d, '/inheritance:r', '/grant:r', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F')
-            if ($r.Code -ne 0) { Fail 'Could not lock down the staging folder {0}: {1}' '\u7121\u6cd5\u9396\u5b9a\u66ab\u5b58\u8cc7\u6599\u593e {0}\uff1a{1}' @($d, $r.Out) 1 }
-        }
-    }
+    try { Set-ExactDacl $p } catch { Fail 'Could not lock down the staging folder {0}: {1}' '\u7121\u6cd5\u9396\u5b9a\u66ab\u5b58\u8cc7\u6599\u593e {0}\uff1a{1}' @($p, $_.Exception.Message) 1 }
     return $p
 }
 
-# Removes this run's own staging folder (and the .staging parent when nothing else is in it).
+# Removes this run's own staging folder (and the .staging parent when nothing else is in it). Links inside are
+# deleted, never followed.
 function Remove-StageDir {
     if ($script:StageDir -and (Test-Path -LiteralPath $script:StageDir)) {
-        Remove-Item -LiteralPath $script:StageDir -Recurse -Force -ErrorAction SilentlyContinue
+        try { Remove-TreeSafe $script:StageDir } catch { }
         if (-not $DryRun) {
             $parent = Split-Path -Parent $script:StageDir
-            if ((Split-Path -Leaf $parent) -eq '.staging' -and (Test-Path -LiteralPath $parent) -and -not (Get-ChildItem -LiteralPath $parent -Force)) {
+            if ((Split-Path -Leaf $parent) -eq '.staging' -and -not (Test-ReparsePoint $parent) -and (Test-Path -LiteralPath $parent) -and -not [IO.Directory]::GetFileSystemEntries($parent).Count) {
                 Remove-Item -LiteralPath $parent -Force -ErrorAction SilentlyContinue
             }
         }
     }
 }
 
-# Deletes the .staging\<guid> folders that earlier (crashed / killed) runs left behind. Only called while this
-# run holds the setup mutex, so no other run can be using one. Links inside are removed, never followed.
+# Deletes the .staging\<guid> folders that earlier (crashed / killed) runs left behind, whatever is inside them.
+# Only called after the install root and .staging are locked and while this run holds the setup mutex, so no other
+# run can be using one. Links inside are removed, never followed.
 function Clear-StaleStaging {
     $stg = Join-Path $InstallRoot '.staging'
-    if (-not (Test-Path -LiteralPath $stg) -or (Test-ReparsePoint $stg)) { return }
+    if (-not (Test-Path -LiteralPath $stg)) { return }
+    if (Test-ReparsePoint $stg) { Fail '{0} is a link (junction/symlink); refusing to use it as the staging folder.' '{0} \u662f\u9023\u7d50\uff08junction\uff0fsymlink\uff09\uff1b\u62d2\u7d55\u628a\u5b83\u7576\u4f5c\u66ab\u5b58\u8cc7\u6599\u593e\u3002' @($stg) 1 }
     foreach ($e in @([IO.Directory]::GetFileSystemEntries($stg))) {
         try {
-            if (Test-ReparsePoint $e) { if (Test-Path -LiteralPath $e -PathType Container) { [IO.Directory]::Delete($e, $false) } else { [IO.File]::Delete($e) }; continue }
-            if (Test-Path -LiteralPath $e -PathType Container) { [void](Remove-ReparsePoints $e) }
-            Remove-Item -LiteralPath $e -Recurse -Force -ErrorAction Stop
+            if (-not (Test-ReparsePoint $e) -and (Test-Path -LiteralPath $e -PathType Container)) {
+                try { Set-ExactDacl $e } catch { }      # close it to normal users first (best effort), then clean it
+            }
+            Remove-TreeSafe $e
         } catch { Warn 'Could not delete the leftover staging folder {0}: {1}' '\u7121\u6cd5\u522a\u9664\u907a\u7559\u7684\u66ab\u5b58\u8cc7\u6599\u593e {0}\uff1a{1}' @($e, $_.Exception.Message) }
     }
-    if (-not [IO.Directory]::GetFileSystemEntries($stg).Count) { Remove-Item -LiteralPath $stg -Force -ErrorAction SilentlyContinue }
 }
 
 function Save-Download([string]$Url, [string]$Dest) {
@@ -642,8 +691,12 @@ function Invoke-Ps51Script([string]$ScriptText, [string]$WorkDir, [string]$Name,
     $ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $f)
     if ($ScriptArgs) { $a += $ScriptArgs }
-    $r = Invoke-BoundedProcess $ps51 $a 60      # a hung validator must not hang the (elevated) setup
-    return @{ Code = $r.Code; Out = $r.Out }
+    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try {
+        $out = (& $ps51 @a 2>&1 | Out-String).Trim()    # local, quick helpers: plain call operator (writer.exe and pnputil are the bounded ones)
+        $rc = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $old }
+    return @{ Code = $rc; Out = $out }
 }
 
 $ValidatorScript = @'
@@ -781,11 +834,33 @@ function Get-MouseDeviceStatus {
     return $r
 }
 
-# Devices that were OK in $Before and are missing or not OK now (devices that were already broken are
-# ignored). A missing device is a regression too; the caller gives it time to reappear.
-function Get-MouseRegressions($Before) {
+# Devices that were OK in $Before and are not OK now (devices that were already broken are ignored):
+# Error = still present but not OK; Missing = no longer listed. A missing device only counts when the list now is
+# not empty (an empty list is a failed / racing enumeration, not evidence about any one mouse).
+function Get-MouseRegressionDetail($Before) {
     $now = Get-MouseDeviceStatus
-    return @($Before.Keys | Where-Object { $Before[$_] -eq 'OK' -and ((-not $now.ContainsKey($_)) -or $now[$_] -ne 'OK') } | Sort-Object)
+    $err = @($Before.Keys | Where-Object { $Before[$_] -eq 'OK' -and $now.ContainsKey($_) -and $now[$_] -ne 'OK' } | Sort-Object)
+    $miss = @()
+    if ($now.Count -gt 0) { $miss = @($Before.Keys | Where-Object { $Before[$_] -eq 'OK' -and -not $now.ContainsKey($_) } | Sort-Object) }
+    return @{ Error = $err; Missing = $miss }
+}
+function Get-MouseRegressions($Before) {
+    $d = Get-MouseRegressionDetail $Before
+    return @(@($d.Error) + @($d.Missing) | Sort-Object)
+}
+
+# Waits for the mouse devices that were OK in $Before to be OK again: Error devices get $MouseSettleSeconds,
+# missing ones $MouseMissingSeconds to reappear. Returns the ones still not OK (empty = healthy).
+function Wait-MouseRecovery($Before) {
+    $t = 0
+    while ($true) {
+        $d = Get-MouseRegressionDetail $Before
+        if ($d.Error.Count -eq 0 -and $d.Missing.Count -eq 0) { return @() }
+        if ($d.Error.Count -gt 0 -and $t -ge $MouseSettleSeconds) { break }
+        if ($t -ge $MouseMissingSeconds) { break }
+        Start-Sleep -Seconds 1; $t++
+    }
+    return @(@($d.Error) + @($d.Missing) | Sort-Object)
 }
 
 # Restarts every present mouse device so the (un)installed filter driver attaches/detaches
@@ -972,7 +1047,7 @@ function Get-CurrentRotation {
         if ($script:DriverProbeFailed) { Fail 'Could not tell whether the Raw Accel driver is running, so the rotation it applies now is unknown. Nothing was changed.' '\u7121\u6cd5\u5224\u65b7 Raw Accel \u9a45\u52d5\u7a0b\u5f0f\u6709\u6c92\u6709\u5728\u904b\u4f5c\uff0c\u6240\u4ee5\u4e0d\u77e5\u9053\u5b83\u76ee\u524d\u5957\u7528\u7684\u65cb\u8f49\u89d2\u5ea6\u3002\u6c92\u6709\u8b8a\u66f4\u4efb\u4f55\u6771\u897f\u3002' @() 1 }
         if (-not $on) { return 0.0 }
         return (Get-ActiveRotation $AppDir $wd)
-    } finally { Remove-Item -LiteralPath $wd -Recurse -Force -ErrorAction SilentlyContinue }
+    } finally { try { Remove-TreeSafe $wd } catch { } }
 }
 
 # Windows PowerShell 5.1 to start: under a 32-bit host System32 is redirected to the 32-bit one, so use Sysnative then.
@@ -1110,19 +1185,23 @@ function Register-UrlProtocol([string]$Dir = '', [string]$Key = '') {
 }
 
 # What the protocol key holds right now ($null = no key), so a failed re-run can put it back exactly.
+function Get-RegValueKindSafe($Key, [string]$Name) {
+    try { $k = [string]$Key.GetValueKind($Name); if ($k) { return $k } } catch { }
+    return 'String'      # kind unavailable: REG_SZ
+}
 function Get-UrlProtocolSnapshot([string]$Key = '') {
     if (-not $Key) { $Key = $ProtocolKey }
     if (-not (Test-Path -LiteralPath $Key)) { return $null }
     $k = Get-Item -LiteralPath $Key
     $snap = @{ HasDefault = ($k.GetValueNames() -contains ''); Default = $null; DefaultKind = 'String'; HasUrlProtocol = ($k.GetValueNames() -contains 'URL Protocol'); UrlProtocol = $null; UrlProtocolKind = 'String'; HasCommand = $false; Command = $null; CommandKind = 'String'; HasCommandDefault = $false }
-    if ($snap.HasDefault) { $snap.Default = $k.GetValue('', $null, 'DoNotExpandEnvironmentNames'); $snap.DefaultKind = [string]$k.GetValueKind('') }
-    if ($snap.HasUrlProtocol) { $snap.UrlProtocol = $k.GetValue('URL Protocol', $null, 'DoNotExpandEnvironmentNames'); $snap.UrlProtocolKind = [string]$k.GetValueKind('URL Protocol') }
+    if ($snap.HasDefault) { $snap.Default = $k.GetValue('', $null, 'DoNotExpandEnvironmentNames'); $snap.DefaultKind = (Get-RegValueKindSafe $k '') }
+    if ($snap.HasUrlProtocol) { $snap.UrlProtocol = $k.GetValue('URL Protocol', $null, 'DoNotExpandEnvironmentNames'); $snap.UrlProtocolKind = (Get-RegValueKindSafe $k 'URL Protocol') }
     $ck = Join-Path $Key 'shell\open\command'
     if (Test-Path -LiteralPath $ck) {
         $c = Get-Item -LiteralPath $ck
         $snap.HasCommand = $true
         $snap.HasCommandDefault = ($c.GetValueNames() -contains '')
-        if ($snap.HasCommandDefault) { $snap.Command = $c.GetValue('', $null, 'DoNotExpandEnvironmentNames'); $snap.CommandKind = [string]$c.GetValueKind('') }
+        if ($snap.HasCommandDefault) { $snap.Command = $c.GetValue('', $null, 'DoNotExpandEnvironmentNames'); $snap.CommandKind = (Get-RegValueKindSafe $c '') }
     }
     return $snap
 }
@@ -1493,7 +1572,7 @@ function Invoke-Install($Arg) {
 
     $script:StageDir = New-StageDir
     if ($DryRun) { Say 'Dry run: staging in a temp folder ({0}); a real run stages in an administrators-only folder.' '\u8a66\u8dd1\uff1a\u66ab\u5b58\u5728\u66ab\u5b58\u8cc7\u6599\u593e\uff08{0}\uff09\uff1b\u6b63\u5f0f\u57f7\u884c\u6703\u66ab\u5b58\u5728\u53ea\u6709\u7cfb\u7d71\u7ba1\u7406\u54e1\u80fd\u5b58\u53d6\u7684\u8cc7\u6599\u593e\u3002' 'Gray' '  ' @($script:StageDir) }
-    else { Ok 'Staging folder {0} (administrators + SYSTEM only).' '\u66ab\u5b58\u8cc7\u6599\u593e {0}\uff08\u53ea\u6709\u7cfb\u7d71\u7ba1\u7406\u54e1\u8207 SYSTEM \u53ef\u5b58\u53d6\uff09\u3002' @($script:StageDir) }
+    else { Ok 'Staging folder {0} (only administrators and SYSTEM can write there).' '\u66ab\u5b58\u8cc7\u6599\u593e {0}\uff08\u53ea\u6709\u7cfb\u7d71\u7ba1\u7406\u54e1\u8207 SYSTEM \u53ef\u5beb\u5165\uff09\u3002' @($script:StageDir) }
 
     $vc = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\X64' -Name Installed -ErrorAction SilentlyContinue
     if ($vc -and $vc.Installed -eq 1) {
@@ -1680,9 +1759,8 @@ function Invoke-Install($Arg) {
                 [void](Restart-MouseDevices)
                 $driverActive = Test-DriverActive $AppDir $script:StageDir
                 # a mouse that worked before and does not now is a failure, even if rawaccel reports Running
-                # (it gets $MouseSettleSeconds seconds to come back or to reappear; devices that were already broken are ignored)
-                $bad = @(Get-MouseRegressions $miceBefore)
-                for ($i = 0; $bad.Count -gt 0 -and $i -lt $MouseSettleSeconds; $i++) { Start-Sleep -Seconds 1; $bad = @(Get-MouseRegressions $miceBefore) }
+                # (Error devices get $MouseSettleSeconds s to come back, missing ones $MouseMissingSeconds s to reappear; devices that were already broken are ignored)
+                $bad = @(Wait-MouseRecovery $miceBefore)
                 if ($bad.Count -gt 0) {
                     Fail 'A mouse device that worked before is not working after installing the driver ({0}). Everything is being undone.' '\u5b89\u88dd\u9a45\u52d5\u7a0b\u5f0f\u5f8c\uff0c\u539f\u672c\u6b63\u5e38\u7684\u6ed1\u9f20\u88dd\u7f6e\u4e0d\u80fd\u7528\u4e86\uff08{0}\uff09\u3002\u6b63\u5728\u5168\u90e8\u9084\u539f\u3002' @(($bad -join ', ')) 8
                 }
@@ -1799,8 +1877,6 @@ function Invoke-MainCore {
                 return 1
             }
         }
-
-        if (-not $DryRun) { Clear-StaleStaging }     # leftovers of crashed runs; we hold the mutex, so none is in use
 
         if ($arg.Kind -eq 'Uninstall') { Invoke-Uninstall; return 0 }
         $rc = @(Invoke-Install $arg)
