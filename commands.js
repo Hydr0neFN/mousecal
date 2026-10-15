@@ -127,7 +127,7 @@ export function launcherCmd({ measured, restoreEpp = false, mode = 'install', ba
     '$rc=1;$k=1;$mine=$false;$p=$null;',
     m('working'),
     'try{',
-    '[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12;',
+    '[Net.ServicePointManager]::SecurityProtocol=[Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12;',
     "$adm=New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544');",
     "$sys=New-Object Security.Principal.SecurityIdentifier('S-1-5-18');",
     '$sec=New-Object Security.AccessControl.DirectorySecurity;',
