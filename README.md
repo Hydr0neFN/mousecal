@@ -201,13 +201,21 @@ Security limits of the protocol:
 
 Concurrency and permissions: a real run takes the named mutex `Global\mousecal-setup`; a second run exits with
 code 1 ("another mousecal setup is running"). Each run stages in its own `.staging\<guid>` folder and removes only
-that one. `<ProgramFiles>\RawAccel\RawAccel` and `...\mousecal` are locked to SYSTEM + Administrators full control
-and Users read & execute (SIDs, inheritance removed, applied recursively, owner Administrators) before any file is
-copied and again after `settings.json` is written, even if the folder pre-existed with user write access. So
+that one; stale `.staging\<guid>` folders of crashed runs are deleted at startup (while holding the mutex).
+`<ProgramFiles>\RawAccel` (the folder itself), `...\RawAccel\RawAccel` and `...\mousecal` get an exact DACL: a fresh
+protected ACL with only SYSTEM full control, Administrators full control and Users read & execute (SIDs; every other
+entry, such as Everyone, a single user or a deny, is removed), owner Administrators; everything below the last two is
+reset to inherit exactly that. The root is locked before `.staging` is created, the app dir before any file is
+copied, and again after `settings.json` is written, even if the folders pre-existed with user write access.
+Junctions / symlinks found inside the app or handler folder are deleted (never followed) before any recursive
+operation; a link as the folder itself aborts the run. Elevated runs only search the Windows and Program Files module
+folders (not `Documents\WindowsPowerShell\Modules`). `writer.exe` is stopped (and the run rolled back) if it takes
+longer than 30 s. So
 editing `settings.json`, or saving from the Raw Accel GUI, needs an administrator. If the driver profiles have
 different rotations, `-Measured` and the one-click button refuse (exit 3); `-Rotation <deg>` still sets them all.
-After the mouse devices are restarted, any mouse that was OK before and is not OK now undoes the install (exit 8),
-even when the driver reports Running.
+After the mouse devices are restarted, any mouse that was OK before and is not OK now, or is missing and does not
+reappear within 10 s, undoes the install (exit 8), even when the driver reports Running. If this run restarted the
+mouse devices, a rollback restarts them again.
 
 `-Uninstall` removes the registry key (only if its command still points at this handler), the three files and
 the folder (if nothing else is in it). It does this after the driver removal succeeded, so a failed uninstall
@@ -237,6 +245,9 @@ service key, and also waits for a key. That is why completion is detected by obs
   Microsoft signature, and you can read it first (the link on the page) or run it with `-DryRun`.
 - Nothing is executed from a user-writable location while elevated: the zip is hashed in memory and staged in
   an administrators-only folder; the validator script and DLLs it loads live there or under Program Files.
+- Known limit (accepted): the setup mutex `Global\mousecal-setup` is a plain named mutex, so another local process
+  can create it first and make real runs report "another mousecal setup is running" (denial of service only; it
+  cannot make setup do anything). Reboot or end that process to clear it.
 - `-DryRun` is exempt: it never elevates, changes nothing, and stages in `%TEMP%`. Real runs never execute or load anything from `%TEMP%`.
 - Uninstall touches only what the ownership marker says this tool installed. The marker is
   `<ProgramFilesDir>\RawAccel\RawAccel\.mousecal-installed`, JSON

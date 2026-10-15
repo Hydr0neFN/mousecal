@@ -63,7 +63,9 @@ $DriverSysPath = Join-Path $env:SystemRoot 'System32\drivers\rawaccel.sys'
 $ProtocolKey  = 'HKLM:\SOFTWARE\Classes\mousecal'                   # the mousecal:// URL protocol (one-click apply / uninstall)
 $script:StageDir     = $null
 $SetupMutexName = 'Global\mousecal-setup'                              # one real (non -DryRun) run at a time
-$MouseSettleSeconds = 5                                               # how long a restarted mouse may take to come back (health check)
+$MouseSettleSeconds = 10                                              # how long a restarted mouse may take to come back (health check)
+$AclOwnerSid = 'S-1-5-32-544'                                          # owner of everything we lock down (Administrators)
+$WriterTimeoutSec = 30                                                # writer.exe (and other short helpers) may run this long
 
 # Games / anti-cheat processes: setup refuses to change anything while one is running.
 # The FACEIT, BattlEye and Perfect World Arena names are best-effort (taken from public
@@ -346,23 +348,97 @@ function Invoke-Icacls([string[]]$IcaclsArgs) {
     return @{ Code = $LASTEXITCODE; Out = (($out | Out-String).Trim()) }
 }
 
-# Locks a folder: SYSTEM + Administrators full control, Users read & execute only, inheritance removed
-# (SIDs, so it works on any Windows language). Unless -NoRecurse, everything below it is made to inherit
-# exactly that (explicit entries of any other principal are dropped) and is owned by Administrators, so
-# the files stay unwritable for normal users even when the folder pre-existed with user Full control
-# (a file's owner can always rewrite its permissions).
-function Protect-AppDir([string]$Dir, [switch]$NoRecurse) {
-    $aces = @('*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)RX')
-    if (-not $NoRecurse) {
-        $r = Invoke-Icacls @($Dir, '/setowner', '*S-1-5-32-544', '/T', '/C')
-        if ($r.Code -ne 0) { Fail 'Could not take ownership of {0}: {1}' '無法取得 {0} 的擁有權：{1}' @($Dir, $r.Out) 1 }
+# Reparse points (junctions / symlinks) are never followed. Enumerates with .NET, not Get-ChildItem
+# (Windows PowerShell 5.1 follows junctions when recursing). Deletes the link itself (never its target).
+function Test-ReparsePoint([string]$Path) {
+    try { return (([IO.File]::GetAttributes($Path) -band [IO.FileAttributes]::ReparsePoint) -ne 0) } catch { return $false }
+}
+function Remove-ReparsePoints([string]$Dir) {
+    $removed = New-Object System.Collections.Generic.List[string]
+    $stack = New-Object System.Collections.Generic.Stack[string]
+    $stack.Push($Dir)
+    while ($stack.Count -gt 0) {
+        $d = $stack.Pop()
+        foreach ($e in [IO.Directory]::GetFileSystemEntries($d)) {
+            $a = [IO.File]::GetAttributes($e)
+            if (($a -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                try {
+                    if (($a -band [IO.FileAttributes]::Directory) -ne 0) { [IO.Directory]::Delete($e, $false) } else { [IO.File]::Delete($e) }
+                } catch { Fail 'Found a link (junction/symlink) at {0} that cannot be removed ({1}); refusing to continue.' '在 {0} 發現無法移除的連結（junction／symlink）（{1}）；拒絕繼續。' @($e, $_.Exception.Message) 1 }
+                $removed.Add($e)
+            } elseif (($a -band [IO.FileAttributes]::Directory) -ne 0) { $stack.Push($e) }
+        }
     }
-    $r = Invoke-Icacls (@($Dir, '/inheritance:r', '/grant:r') + $aces)
-    if ($r.Code -ne 0) { Fail 'Could not lock down the folder {0}: {1}' '無法鎖定資料夾 {0}：{1}' @($Dir, $r.Out) 1 }
-    if (-not $NoRecurse -and (Get-ChildItem -LiteralPath $Dir -Force | Select-Object -First 1)) {
+    return $removed.ToArray()
+}
+
+# Replaces the DACL of one folder with exactly: SYSTEM F, Administrators F, Users RX (all container+object
+# inherit), protected, no other entry of any kind (explicit entries are removed one by one, inherited ones are
+# dropped by the protection), owner Administrators. SIDs only, so it works on any Windows language.
+function Set-ExactDacl([string]$Path) {
+    $acl = Get-Acl -LiteralPath $Path
+    $acl.SetAccessRuleProtection($true, $false)
+    foreach ($r in @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))) { [void]$acl.RemoveAccessRuleSpecific($r) }
+    $inh = [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $none = [Security.AccessControl.PropagationFlags]::None
+    $allow = [Security.AccessControl.AccessControlType]::Allow
+    foreach ($e in @(@('S-1-5-18', 'FullControl'), @('S-1-5-32-544', 'FullControl'), @('S-1-5-32-545', 'ReadAndExecute'))) {
+        $sid = New-Object Security.Principal.SecurityIdentifier($e[0])
+        $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($sid, [Security.AccessControl.FileSystemRights]$e[1], $inh, $none, $allow)))
+    }
+    $owner = New-Object Security.Principal.SecurityIdentifier($AclOwnerSid)
+    $cur = $null
+    try { $cur = $acl.GetOwner([Security.Principal.SecurityIdentifier]) } catch { }
+    if (-not $cur -or $cur.Value -ne $owner.Value) { $acl.SetOwner($owner) }
+    Set-Acl -LiteralPath $Path -AclObject $acl
+}
+
+# Locks a folder to EXACTLY: SYSTEM + Administrators full control, Users read & execute only, inheritance
+# removed, owner Administrators (Set-ExactDacl: whatever else was on the folder - Everyone, a single user,
+# deny entries - is gone). Unless -NoRecurse, everything below it is then owned by Administrators and reset to
+# inherit exactly that (explicit entries of any other principal are dropped), so the files stay unwritable for
+# normal users even when the folder pre-existed with user Full control (a file's owner can always rewrite its
+# permissions). Links (junctions/symlinks) inside are deleted first and never followed; the folder itself
+# being a link is refused.
+function Protect-AppDir([string]$Dir, [switch]$NoRecurse) {
+    if (Test-ReparsePoint $Dir) { Fail '{0} is a link (junction/symlink); refusing to change its permissions.' '{0} 是連結（junction／symlink）；拒絕變更它的權限。' @($Dir) 1 }
+    try { Set-ExactDacl $Dir } catch { Fail 'Could not lock down the folder {0}: {1}' '無法鎖定資料夾 {0}：{1}' @($Dir, $_.Exception.Message) 1 }
+    if ($NoRecurse) { return }
+    # the folder is closed to normal users now; links are removed before any recursive (/T) operation
+    $links = @(Remove-ReparsePoints $Dir)
+    if ($links.Count -gt 0) { Warn 'Removed {0} link(s) (junction/symlink) found inside {1}: {2}' '已移除 {1} 裡發現的 {0} 個連結（junction／symlink）：{2}' @($links.Count, $Dir, ($links -join ', ')) }
+    if ([IO.Directory]::GetFileSystemEntries($Dir).Count -gt 0) {
+        $r = Invoke-Icacls @($Dir, '/setowner', ('*' + $AclOwnerSid), '/T', '/C')
+        if ($r.Code -ne 0) { Fail 'Could not take ownership of {0}: {1}' '無法取得 {0} 的擁有權：{1}' @($Dir, $r.Out) 1 }
         $r = Invoke-Icacls @((Join-Path $Dir '*'), '/reset', '/T', '/C')
         if ($r.Code -ne 0) { Fail 'Could not lock down the files in {0}: {1}' '無法鎖定 {0} 裡的檔案：{1}' @($Dir, $r.Out) 1 }
     }
+}
+
+# Runs a program with a hard time limit and captures its output (stdout + stderr). On timeout the process
+# is killed. Returns @{ Code; Out; TimedOut }.
+function Invoke-BoundedProcess([string]$File, [string[]]$ProcArgs, [int]$TimeoutSec) {
+    $psi = New-Object Diagnostics.ProcessStartInfo
+    $psi.FileName = $File
+    $psi.Arguments = (@($ProcArgs | ForEach-Object { '"' + (([string]$_).Replace('"', '\"') -replace '(\\+)$', '$1$1') + '"' }) -join ' ')
+    $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.CreateNoWindow = $true
+    $p = [Diagnostics.Process]::Start($psi)
+    try {
+        $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
+        if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+            try { $p.Kill() } catch { }
+            return @{ Code = 124; Out = ('timed out after {0} s' -f $TimeoutSec); TimedOut = $true }
+        }
+        $p.WaitForExit()
+        return @{ Code = $p.ExitCode; Out = (($o.Result + $e.Result).Trim()); TimedOut = $false }
+    } finally { $p.Dispose() }
+}
+
+# Waits at most $TimeoutSec for a started process; kills it when it is still running. $true = it exited by itself.
+function Wait-ChildProcess($Proc, [int]$TimeoutSec) {
+    if ($Proc.WaitForExit($TimeoutSec * 1000)) { return $true }
+    try { Stop-Process -Id $Proc.Id -Force -ErrorAction SilentlyContinue } catch { }
+    return $false
 }
 
 # ------------------------------------------------------- one run at a time
@@ -393,13 +469,20 @@ function Get-StagePath {
 
 function New-StageDir {
     $p = Get-StagePath
-    if (-not $DryRun -and -not (Test-Path -LiteralPath $InstallRoot)) {
-        New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
-        if ($script:Tx) { $script:Tx.RootCreated = $true }
+    if (-not $DryRun) {
+        if (-not (Test-Path -LiteralPath $InstallRoot)) {
+            New-Item -ItemType Directory -Path $InstallRoot -Force | Out-Null
+            if ($script:Tx) { $script:Tx.RootCreated = $true }
+        }
+        # the root is locked (exact DACL, owner Administrators) BEFORE .staging is created inside it
+        Protect-AppDir $InstallRoot -NoRecurse
     }
     New-Item -ItemType Directory -Path $p -Force | Out-Null
     if (-not $DryRun) {
         foreach ($d in (Split-Path -Parent $p), $p) {
+            # owner first, then the ACL
+            $r = Invoke-Icacls @($d, '/setowner', ('*' + $AclOwnerSid))
+            if ($r.Code -ne 0) { Fail 'Could not take ownership of the staging folder {0}: {1}' '無法取得暫存資料夾 {0} 的擁有權：{1}' @($d, $r.Out) 1 }
             $r = Invoke-Icacls @($d, '/inheritance:r', '/grant:r', '*S-1-5-32-544:(OI)(CI)F', '*S-1-5-18:(OI)(CI)F')
             if ($r.Code -ne 0) { Fail 'Could not lock down the staging folder {0}: {1}' '無法鎖定暫存資料夾 {0}：{1}' @($d, $r.Out) 1 }
         }
@@ -420,6 +503,21 @@ function Remove-StageDir {
     }
 }
 
+# Deletes the .staging\<guid> folders that earlier (crashed / killed) runs left behind. Only called while this
+# run holds the setup mutex, so no other run can be using one. Links inside are removed, never followed.
+function Clear-StaleStaging {
+    $stg = Join-Path $InstallRoot '.staging'
+    if (-not (Test-Path -LiteralPath $stg) -or (Test-ReparsePoint $stg)) { return }
+    foreach ($e in @([IO.Directory]::GetFileSystemEntries($stg))) {
+        try {
+            if (Test-ReparsePoint $e) { if (Test-Path -LiteralPath $e -PathType Container) { [IO.Directory]::Delete($e, $false) } else { [IO.File]::Delete($e) }; continue }
+            if (Test-Path -LiteralPath $e -PathType Container) { [void](Remove-ReparsePoints $e) }
+            Remove-Item -LiteralPath $e -Recurse -Force -ErrorAction Stop
+        } catch { Warn 'Could not delete the leftover staging folder {0}: {1}' '無法刪除遺留的暫存資料夾 {0}：{1}' @($e, $_.Exception.Message) }
+    }
+    if (-not [IO.Directory]::GetFileSystemEntries($stg).Count) { Remove-Item -LiteralPath $stg -Force -ErrorAction SilentlyContinue }
+}
+
 function Save-Download([string]$Url, [string]$Dest) {
     $wc = New-Object Net.WebClient
     try { $wc.DownloadFile($Url, $Dest) } finally { $wc.Dispose() }
@@ -437,12 +535,10 @@ function Invoke-Ps51Script([string]$ScriptText, [string]$WorkDir, [string]$Name,
     $f = Join-Path $WorkDir $Name
     [IO.File]::WriteAllText($f, $ScriptText, [Text.Encoding]::ASCII)
     $ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    try {
-        $out = (& $ps51 -NoProfile -ExecutionPolicy Bypass -File $f @ScriptArgs 2>&1 | Out-String).Trim()
-        $rc = $LASTEXITCODE
-    } finally { $ErrorActionPreference = $old }
-    return @{ Code = $rc; Out = $out }
+    $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $f)
+    if ($ScriptArgs) { $a += $ScriptArgs }
+    $r = Invoke-BoundedProcess $ps51 $a 60      # a hung validator must not hang the (elevated) setup
+    return @{ Code = $r.Code; Out = $r.Out }
 }
 
 $ValidatorScript = @'
@@ -580,11 +676,11 @@ function Get-MouseDeviceStatus {
     return $r
 }
 
-# Devices that were OK in $Before and are present but not OK now (devices that were already
-# broken, or are gone, are ignored).
+# Devices that were OK in $Before and are missing or not OK now (devices that were already broken are
+# ignored). A missing device is a regression too; the caller gives it time to reappear.
 function Get-MouseRegressions($Before) {
     $now = Get-MouseDeviceStatus
-    return @($Before.Keys | Where-Object { $Before[$_] -eq 'OK' -and $now.ContainsKey($_) -and $now[$_] -ne 'OK' } | Sort-Object)
+    return @($Before.Keys | Where-Object { $Before[$_] -eq 'OK' -and ((-not $now.ContainsKey($_)) -or $now[$_] -ne 'OK') } | Sort-Object)
 }
 
 # Restarts every present mouse device so the (un)installed filter driver attaches/detaches
@@ -598,9 +694,9 @@ function Restart-MouseDevices([switch]$All) {
         $devs = @(Get-PnpDevice -Class Mouse -PresentOnly -ErrorAction SilentlyContinue | Where-Object { $All -or $_.Status -eq 'OK' })
         foreach ($d in $devs) {
             try {
-                $null = & pnputil.exe /restart-device "$($d.InstanceId)" 2>&1
-                if ($LASTEXITCODE -eq 0) { $done++ }
-                else { Warn 'Could not restart device {0} (pnputil exit code {1}); continuing.' '無法重新啟動裝置 {0}（pnputil 結束代碼 {1}），繼續。' @($d.FriendlyName, $LASTEXITCODE) }
+                $pr = Invoke-BoundedProcess (Join-Path $env:SystemRoot 'System32\pnputil.exe') @('/restart-device', [string]$d.InstanceId) $WriterTimeoutSec
+                if ($pr.Code -eq 0) { $done++ }
+                else { Warn 'Could not restart device {0} (pnputil exit code {1}); continuing.' '無法重新啟動裝置 {0}（pnputil 結束代碼 {1}），繼續。' @($d.FriendlyName, $pr.Code) }
             } catch {
                 Warn 'Could not restart device {0}: {1}; continuing.' '無法重新啟動裝置 {0}：{1}，繼續。' @($d.FriendlyName, $_.Exception.Message)
             }
@@ -913,30 +1009,36 @@ function Get-UrlProtocolSnapshot([string]$Key = '') {
     if (-not $Key) { $Key = $ProtocolKey }
     if (-not (Test-Path -LiteralPath $Key)) { return $null }
     $k = Get-Item -LiteralPath $Key
-    $snap = @{ HasDefault = ($k.GetValueNames() -contains ''); Default = $null; HasUrlProtocol = ($k.GetValueNames() -contains 'URL Protocol'); UrlProtocol = $null; HasCommand = $false; Command = $null; HasCommandDefault = $false }
-    if ($snap.HasDefault) { $snap.Default = $k.GetValue('', $null, 'DoNotExpandEnvironmentNames') }
-    if ($snap.HasUrlProtocol) { $snap.UrlProtocol = $k.GetValue('URL Protocol', $null, 'DoNotExpandEnvironmentNames') }
+    $snap = @{ HasDefault = ($k.GetValueNames() -contains ''); Default = $null; DefaultKind = 'String'; HasUrlProtocol = ($k.GetValueNames() -contains 'URL Protocol'); UrlProtocol = $null; UrlProtocolKind = 'String'; HasCommand = $false; Command = $null; CommandKind = 'String'; HasCommandDefault = $false }
+    if ($snap.HasDefault) { $snap.Default = $k.GetValue('', $null, 'DoNotExpandEnvironmentNames'); $snap.DefaultKind = [string]$k.GetValueKind('') }
+    if ($snap.HasUrlProtocol) { $snap.UrlProtocol = $k.GetValue('URL Protocol', $null, 'DoNotExpandEnvironmentNames'); $snap.UrlProtocolKind = [string]$k.GetValueKind('URL Protocol') }
     $ck = Join-Path $Key 'shell\open\command'
     if (Test-Path -LiteralPath $ck) {
         $c = Get-Item -LiteralPath $ck
         $snap.HasCommand = $true
         $snap.HasCommandDefault = ($c.GetValueNames() -contains '')
-        if ($snap.HasCommandDefault) { $snap.Command = $c.GetValue('', $null, 'DoNotExpandEnvironmentNames') }
+        if ($snap.HasCommandDefault) { $snap.Command = $c.GetValue('', $null, 'DoNotExpandEnvironmentNames'); $snap.CommandKind = [string]$c.GetValueKind('') }
     }
     return $snap
+}
+
+# Writes a registry value with its original kind (REG_EXPAND_SZ stays REG_EXPAND_SZ, not REG_SZ). '' = the default value.
+function Set-RegistryValueKind([string]$Path, [string]$Name, $Value, [string]$Kind) {
+    if (@('String', 'ExpandString', 'Binary', 'DWord', 'MultiString', 'QWord') -notcontains $Kind) { $Kind = 'String' }
+    New-ItemProperty -LiteralPath $Path -Name $(if ($Name) { $Name } else { '(default)' }) -Value $Value -PropertyType $Kind -Force | Out-Null
 }
 
 function Restore-UrlProtocolSnapshot($Snap, [string]$Key = '') {
     if (-not $Key) { $Key = $ProtocolKey }
     if ($null -eq $Snap) { if (Test-Path -LiteralPath $Key) { Remove-Item -LiteralPath $Key -Recurse -Force }; return }
     if (-not (Test-Path -LiteralPath $Key)) { New-Item -Path $Key -Force | Out-Null }
-    if ($Snap.HasDefault) { Set-Item -LiteralPath $Key -Value $Snap.Default } else { Remove-ItemProperty -LiteralPath $Key -Name '(default)' -ErrorAction SilentlyContinue }
-    if ($Snap.HasUrlProtocol) { New-ItemProperty -LiteralPath $Key -Name 'URL Protocol' -Value $Snap.UrlProtocol -PropertyType String -Force | Out-Null }
+    if ($Snap.HasDefault) { Set-RegistryValueKind $Key '' $Snap.Default $Snap.DefaultKind } else { Remove-ItemProperty -LiteralPath $Key -Name '(default)' -ErrorAction SilentlyContinue }
+    if ($Snap.HasUrlProtocol) { Set-RegistryValueKind $Key 'URL Protocol' $Snap.UrlProtocol $Snap.UrlProtocolKind }
     else { Remove-ItemProperty -LiteralPath $Key -Name 'URL Protocol' -ErrorAction SilentlyContinue }
     $ck = Join-Path $Key 'shell\open\command'
     if ($Snap.HasCommand) {
         if (-not (Test-Path -LiteralPath $ck)) { New-Item -Path $ck -Force | Out-Null }
-        if ($Snap.HasCommandDefault) { Set-Item -LiteralPath $ck -Value $Snap.Command } else { Remove-ItemProperty -LiteralPath $ck -Name '(default)' -ErrorAction SilentlyContinue }
+        if ($Snap.HasCommandDefault) { Set-RegistryValueKind $ck '' $Snap.Command $Snap.CommandKind } else { Remove-ItemProperty -LiteralPath $ck -Name '(default)' -ErrorAction SilentlyContinue }
     } elseif (Test-Path -LiteralPath (Join-Path $Key 'shell')) { Remove-Item -LiteralPath (Join-Path $Key 'shell') -Recurse -Force }
 }
 
@@ -1025,7 +1127,7 @@ function New-Tx {
         Mutated = $false; RootCreated = $false; AppDirCreated = $false; CreatedFiles = @()
         SettingsExisted = $false; SettingsBytes = $null; SettingsWritten = $false; BackupPath = $null
         DriverInstalled = $false; PriorDriver = $false; PriorAppDir = $false; OrigMarkerBytes = $null; Overwritten = @(); OldTaskXml = $null; HadOldTask = $false; TaskRegistered = $false; OldVbsBytes = $null
-        ProtocolRegistered = $false; PriorProtocol = $false; ProtocolSnapshot = $null
+        ProtocolRegistered = $false; PriorProtocol = $false; ProtocolSnapshot = $null; DevicesRestarted = $false
     }
 }
 
@@ -1047,15 +1149,22 @@ function Invoke-Rollback {
                 else { Restore-UrlProtocolSnapshot $tx.ProtocolSnapshot }      # the key's previous values, exactly (or no key if there was none)
             } catch { $problems.Add('mousecal:// link: ' + $_.Exception.Message) }
         }
+        $restartedInRollback = $false
         if ($tx.DriverInstalled -and $script:StageDir) {
             $un =Join-Path $script:StageDir 'uninstaller.exe'
             if (Test-Path -LiteralPath $un) {
                 try {
                     $u = Invoke-DriverTool $un 'uninstall'
                     if (-not $u.Ok) { $problems.Add('driver uninstall did not finish: ' + $u.Output) }
+                    $restartedInRollback = $true
                     [void](Restart-MouseDevices -All)
                 } catch { $problems.Add('uninstaller.exe: ' + $_.Exception.Message) }
             } else { $problems.Add('uninstaller.exe not available') }
+        }
+        # this run restarted the mice (so they re-attached the filter stack as it was then): restart them again
+        # after the undo, also when the filter was there before this run and the driver was not uninstalled
+        if ($tx.DevicesRestarted -and -not $restartedInRollback) {
+            try { [void](Restart-MouseDevices -All) } catch { $problems.Add('restart mouse devices: ' + $_.Exception.Message) }
         }
         if ($tx.SettingsWritten) {
             try {
@@ -1079,15 +1188,27 @@ function Invoke-Rollback {
 }
 
 # ------------------------------------------------------------------ misc steps
-function Repair-ModulePath {
-    # Windows PowerShell 5.1 started from PowerShell 7 inherits a PSModulePath that puts the
-    # PS 7 modules first; they cannot load in 5.1. Drop those entries for the run.
-    if ($PSVersionTable.PSEdition -ne 'Desktop') { return $null }
-    $orig = $env:PSModulePath
+# The module search path for this run. Windows PowerShell 5.1 started from PowerShell 7 inherits a PSModulePath
+# that puts the PS 7 modules first; they cannot load in 5.1. And an elevated run must not auto-load modules
+# from a user-writable place (Documents\WindowsPowerShell\Modules, OneDrive, ...): only the Windows / Program
+# Files module folders are kept.
+function Get-SafeModulePath([string]$Path, [bool]$Elevated, [bool]$Desktop = $true) {
     $ps7 = '(?i)\\WindowsApps\\Microsoft\.PowerShell|\\Program Files\\PowerShell\\|\\Documents\\PowerShell\\'
-    $keep = @($orig -split ';' | Where-Object { $_ -and ($_ -notmatch $ps7) })
-    if ($keep.Count -eq @($orig -split ';' | Where-Object { $_ }).Count) { return $null }
-    $env:PSModulePath = ($keep -join ';')
+    $keep = @($Path -split ';' | Where-Object { $_ })
+    if ($Desktop) { $keep = @($keep | Where-Object { $_ -notmatch $ps7 }) }
+    if ($Elevated) {
+        $roots = @($env:SystemRoot, [Environment]::GetFolderPath('ProgramFiles'), [Environment]::GetFolderPath('ProgramFilesX86'), $PSHOME) | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') + '\' }
+        $keep = @($keep | Where-Object { $m = $_.TrimEnd('\') + '\'; @($roots | Where-Object { $m.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0 })
+        if ($keep.Count -eq 0) { $keep = @((Join-Path $PSHOME 'Modules')) }
+    }
+    return ($keep -join ';')
+}
+
+function Repair-ModulePath {
+    $orig = $env:PSModulePath
+    $new = Get-SafeModulePath $orig (Test-IsAdmin) ($PSVersionTable.PSEdition -eq 'Desktop')
+    if ($new -eq (@($orig -split ';' | Where-Object { $_ }) -join ';')) { return $null }
+    $env:PSModulePath = $new
     return $orig
 }
 
@@ -1221,6 +1342,7 @@ function Invoke-Uninstall {
 
     # --- files
     if ($marker.createdAppDir) {
+        if (-not $DryRun -and (Test-Path -LiteralPath $AppDir -PathType Container) -and -not (Test-ReparsePoint $AppDir)) { [void](Remove-ReparsePoints $AppDir) }   # links are deleted, never followed
         $c = Get-OwnedFileClassification $AppDir
         if ($DryRun) {
             Dry 'Delete {0} files we installed from {1}' '從 {1} 刪除 {0} 個我們安裝的檔案' @($c.Known.Count, $AppDir)
@@ -1281,7 +1403,8 @@ function Invoke-Install($Arg) {
         if ($sig.Status -ne 'Valid' -or -not $sig.SignerCertificate -or $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
             Fail 'vc_redist.x64.exe does not carry a valid Microsoft signature (status: {0}). Aborting.' 'vc_redist.x64.exe 沒有有效的 Microsoft 簽章（狀態：{0}）。已中止。' @($sig.Status) 5
         }
-        $p = Start-Process -FilePath $vcExe -ArgumentList '/install', '/quiet', '/norestart' -Wait -PassThru
+        $p = Start-Process -FilePath $vcExe -ArgumentList '/install', '/quiet', '/norestart' -PassThru
+        if (-not (Wait-ChildProcess $p 600)) { Fail 'The VC++ runtime installer did not finish within 10 minutes and was stopped.' 'VC++ 執行階段安裝程式在 10 分鐘內沒有完成，已被終止。' @() 7 }
         if (@(0, 1638, 3010) -notcontains $p.ExitCode) {
             Fail 'VC++ runtime installer failed (exit code {0}).' 'VC++ 執行階段安裝失敗（結束代碼 {0}）。' @($p.ExitCode) 7
         }
@@ -1448,10 +1571,11 @@ function Invoke-Install($Arg) {
             } else {
                 $miceBefore = Get-MouseDeviceStatus
                 Say 'Restarting mouse devices so the driver attaches (the pointer may freeze for a second)...' '重新啟動滑鼠裝置讓驅動程式掛上去（游標可能停頓一秒）……'
+                $tx.DevicesRestarted = $true       # set first: a rollback restarts them again
                 [void](Restart-MouseDevices)
                 $driverActive = Test-DriverActive $AppDir $script:StageDir
                 # a mouse that worked before and does not now is a failure, even if rawaccel reports Running
-                # (it gets a few seconds to come back; devices that were already broken are ignored)
+                # (it gets $MouseSettleSeconds seconds to come back or to reappear; devices that were already broken are ignored)
                 $bad = @(Get-MouseRegressions $miceBefore)
                 for ($i = 0; $bad.Count -gt 0 -and $i -lt $MouseSettleSeconds; $i++) { Start-Sleep -Seconds 1; $bad = @(Get-MouseRegressions $miceBefore) }
                 if ($bad.Count -gt 0) {
@@ -1495,7 +1619,8 @@ function Invoke-Install($Arg) {
         if ($driverActive -and $gamesNow.Count -eq 0) {
             $writer = Join-Path $AppDir 'writer.exe'
             Assert-PinnedFile $writer 'writer.exe'
-            $w = Start-Process -FilePath $writer -ArgumentList ('"{0}"' -f $SettingsPath) -WorkingDirectory $AppDir -WindowStyle Hidden -Wait -PassThru
+            $w = Start-Process -FilePath $writer -ArgumentList ('"{0}"' -f $SettingsPath) -WorkingDirectory $AppDir -WindowStyle Hidden -PassThru
+            if (-not (Wait-ChildProcess $w $WriterTimeoutSec)) { Fail 'writer.exe did not finish within {0} seconds and was stopped. Everything is being undone.' 'writer.exe 在 {0} 秒內沒有完成，已被終止。正在全部還原。' @($WriterTimeoutSec) 1 }
             if ($w.ExitCode -ne 0) { Fail 'writer.exe failed to apply the settings (exit code {0}). Everything is being undone.' 'writer.exe 套用設定失敗（結束代碼 {0}）。正在全部還原。' @($w.ExitCode) 1 }
             $verified = $null     # $true = read back and equal, $false = read back and different, $null = could not read back
             try { $now = Get-ActiveRotation $AppDir $script:StageDir; $verified = ([math]::Abs($now - $newRot) -lt 0.01) } catch { $verified = $null }
@@ -1569,6 +1694,8 @@ function Invoke-MainCore {
                 return 1
             }
         }
+
+        if (-not $DryRun) { Clear-StaleStaging }     # leftovers of crashed runs; we hold the mutex, so none is in use
 
         if ($arg.Kind -eq 'Uninstall') { Invoke-Uninstall; return 0 }
         $rc = @(Invoke-Install $arg)

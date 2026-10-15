@@ -17,6 +17,9 @@ $env:MOUSECAL_NO_PAUSE = '1'
 $setupPath = Join-Path $here '..\setup.ps1'
 . $setupPath
 $src = [IO.File]::ReadAllText($setupPath)
+# Windows PowerShell 5.1 started from PowerShell 7 inherits a PSModulePath it cannot load Microsoft.PowerShell.Security from (Get-Acl);
+# setup.ps1 repairs it in Invoke-MainCore, the tests call the functions directly, so repair it here the same way.
+$env:PSModulePath = Get-SafeModulePath $env:PSModulePath $false ($PSVersionTable.PSEdition -eq 'Desktop')
 
 # ---- SAFETY: nothing in this file may touch the real HKLM:\SOFTWARE\Classes\mousecal or run icacls on a real
 # path. Invoke-Icacls (the only way setup.ps1 runs icacls) only records its arguments here; the one test that
@@ -30,8 +33,13 @@ $applySafety = {
     $ProtocolKey = $testKey
     function Protect-HandlerDir { param($Dir) $script:protectCalls += $Dir }
     function Invoke-Icacls { param([string[]]$IcaclsArgs) $script:aclCalls += , $IcaclsArgs; return @{ Code = 0; Out = '' } }
+    function Set-ExactDacl { param([string]$Path) $script:aclCalls += , @($Path, 'EXACT-DACL') }
+    function Clear-StaleStaging { $script:staleCalls++ }      # the real one deletes folders: only ever run against the throw-away InstallRoot (L3 test)
 }
 $realInvokeIcacls = ${function:Invoke-Icacls}   # only ever used on the throw-away folder in the round-3 section
+$realSetExactDacl = ${function:Set-ExactDacl}   # ditto (Set-Acl on the throw-away folder only)
+$realClearStale = ${function:Clear-StaleStaging}   # ditto (deletes .staging\* of the throw-away InstallRoot only)
+$script:staleCalls = 0
 . $applySafety
 $hklmKeyBefore = Test-Path -LiteralPath 'HKLM:\SOFTWARE\Classes\mousecal'
 function Remove-TestKey { if (Test-Path -LiteralPath $testKey) { Remove-Item -LiteralPath $testKey -Recurse -Force -ErrorAction SilentlyContinue } }
@@ -528,7 +536,7 @@ Check 'install marks the protocol for rollback BEFORE registering it' ($src -mat
 Check 'rollback unregisters the protocol (unless it existed before this run, then it restores the key)' ($src -match '(?s)function Invoke-Rollback.*?ProtocolRegistered.*?-not \$tx\.PriorProtocol\) \{ Unregister-UrlProtocol \}.*?Restore-UrlProtocolSnapshot')
 Check 'uninstall removes the protocol in both branches (marker / no marker)' ((([regex]::Matches($src, 'Remove-UrlProtocolStep')).Count) -ge 3)
 Check 'dry run prints the protocol registration' ($src -match "Dry 'Register the mousecal:// URL protocol")
-Check 'handler files are never made user-writable (read & execute only for Users)' ($src -match '\*S-1-5-32-545:\(OI\)\(CI\)RX' -and $src -notmatch '\*S-1-5-32-545:\(OI\)\(CI\)(F|M|W)')
+Check 'handler files are never made user-writable (read & execute only for Users)' ($src -match "@\('S-1-5-32-545', 'ReadAndExecute'\)" -and $src -notmatch "@\('S-1-5-32-545', '(FullControl|Modify|Write)")
 Check 'elevation targets only the local copy with -Rotation / -Uninstall' ($src -match "Invoke-Elevated \`$McSetup \`$elevArgs" -and $src -match "'-Rotation', \(Format-Rotation \`$new\), '-NoPause'" -and $src -match "'-Uninstall', '-NoPause'")
 
 # =====================================================================================
@@ -550,6 +558,14 @@ try {
     $ZipSha256 = Get-BytesSha256 $fakeZip
 
     # ---- stubs
+    # a started child: WaitForExit() says whether it finished within the time limit ($script:writerHang = it never does)
+    $script:writerHang = $false; $script:waitedMs = $null; $script:killed = 0
+    function New-FakeProc([int]$Exit) {
+        $o = [pscustomobject]@{ ExitCode = $Exit; Id = 4242 }
+        Add-Member -InputObject $o -MemberType ScriptMethod -Name WaitForExit -Value { param($ms) $script:waitedMs = $ms; return (-not $script:writerHang) }
+        return $o
+    }
+    function Stop-Process { param($Id, [switch]$Force, $ErrorAction) $script:killed++ }
     $script:calls = @{ Unregister = 0; Register = 0; Tool = 0; ActiveReads = 0 }
     $script:writerExit = 0; $script:failReadBack = $false; $script:toolOk = $true; $script:probeFails = $false
     function Get-RawAccelZipBytes { return , $fakeZip }
@@ -566,7 +582,7 @@ try {
     function Restart-MouseDevices { param([switch]$All) return 0 }
     function Get-MouseDeviceStatus { return @{} }
     function Get-RunningAntiCheatGames { return @() }
-    function Start-Process { param($FilePath, $ArgumentList, $WorkingDirectory, $WindowStyle, [switch]$Wait, [switch]$PassThru) return [pscustomobject]@{ ExitCode = $script:writerExit } }
+    function Start-Process { param($FilePath, $ArgumentList, $WorkingDirectory, $WindowStyle, [switch]$Wait, [switch]$PassThru) return (New-FakeProc $script:writerExit) }
     function Get-AuthenticodeSignature { param($LiteralPath) return [pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = 'CN=fake, O=Microsoft Corporation' } } }
     function Test-SettingsJson { param($d, $j, $w) }
     function Invoke-DriverTool { param($Exe, $Mode, $TimeoutSec) $script:calls.Tool++; $script:lastTool = $Exe; return @{ Ok = $script:toolOk; Output = 'stub' } }
@@ -822,75 +838,125 @@ try {
     $script:statusNow = @{ 'A' = 'Error'; 'B' = 'Error' }
     Check 'F6 OK before, not OK now -> regression (pre-existing broken B ignored)' ((@(Get-MouseRegressions @{ 'A' = 'OK'; 'B' = 'Error' }) -join ',') -eq 'A')
     $script:statusNow = @{ 'B' = 'Error' }
-    Check 'F6 a device that is gone is not a regression' (@(Get-MouseRegressions @{ 'A' = 'OK'; 'B' = 'Error' }).Count -eq 0)
+    Check 'S6 a device that was OK and is missing now IS a regression (it gets time to reappear in the install flow)' ((@(Get-MouseRegressions @{ 'A' = 'OK'; 'B' = 'Error' }) -join ',') -eq 'A')
+    Check 'S6 a device that was already broken and is missing is ignored' (@(Get-MouseRegressions @{ 'B' = 'Error' }).Count -eq 0)
+    Check 'S6 the settle time is 10 seconds' ($src -match '\$MouseSettleSeconds = 10\b')
     $script:statusNow = @{ 'A' = 'Unknown' }
     Check 'F6 any non-OK status counts' ((@(Get-MouseRegressions @{ 'A' = 'OK' }) -join ',') -eq 'A')
     Check 'F6 the install no longer uses the old Error-only baseline' ($src -notmatch 'Get-MouseDevicesInError|baselineBad')
 
-    # ---- F5: Protect-AppDir arguments (recorder)
+    # ---- M1/F5: Protect-AppDir arguments (recorders: Set-ExactDacl and Invoke-Icacls only record)
     function Show-Calls { return , @($script:aclCalls | ForEach-Object { $_ -join ' ' }) }
     $fakeApp = Join-Path $sbRoot 'fake-app'; New-Item -ItemType Directory -Path $fakeApp | Out-Null
     $script:aclCalls = @(); Protect-AppDir $fakeApp
     $c = Show-Calls
-    Check 'F5 empty folder: owner + ACL only (nothing to reset)' ($c.Count -eq 2 -and $c[0] -match '/setowner \*S-1-5-32-544 /T' -and $c[1] -match '/inheritance:r /grant:r') ($c -join ' | ')
+    Check 'M1 empty folder: exact DACL only (nothing below to own or reset)' ($c.Count -eq 1 -and $c[0] -ceq ($fakeApp + ' EXACT-DACL')) ($c -join ' | ')
     [IO.File]::WriteAllText((Join-Path $fakeApp 'writer.exe'), 'x')
     $script:aclCalls = @(); Protect-AppDir $fakeApp
     $c = Show-Calls
-    Check 'F5 ACL = SYSTEM F, Administrators F, Users RX by SID, inheritance removed' ($c[1] -ceq ($fakeApp + ' /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX')) $c[1]
-    Check 'F5 ... applied recursively: children reset to inherit it (/T)' ($c.Count -eq 3 -and $c[2] -ceq ((Join-Path $fakeApp '*') + ' /reset /T /C')) ($c -join ' | ')
-    Check 'F5 ... and everything below is owned by Administrators (/T)' ($c[0] -ceq ($fakeApp + ' /setowner *S-1-5-32-544 /T /C'))
+    Check 'M1 the folder gets the exact DACL first' ($c[0] -ceq ($fakeApp + ' EXACT-DACL')) ($c -join ' | ')
+    Check 'M1 ... then everything below is owned by Administrators (/T)' ($c[1] -ceq ($fakeApp + ' /setowner *S-1-5-32-544 /T /C')) ($c -join ' | ')
+    Check 'M1 ... then reset to inherit exactly that (/reset /T)' ($c.Count -eq 3 -and $c[2] -ceq ((Join-Path $fakeApp '*') + ' /reset /T /C')) ($c -join ' | ')
     $script:aclCalls = @(); Protect-AppDir $fakeApp -NoRecurse
     $c = Show-Calls
-    Check 'F5 -NoRecurse: only the folder itself' ($c.Count -eq 1 -and $c[0] -match '/inheritance:r' -and $c[0] -notmatch '/T|/reset|/setowner')
-    Check 'F5 no entry ever gives Users more than read & execute' (-not ((Show-Calls) -match 'S-1-5-32-545:\(OI\)\(CI\)(F|M|W|RW)'))
+    Check 'M1 -NoRecurse: only the folder itself (still the exact DACL)' ($c.Count -eq 1 -and $c[0] -ceq ($fakeApp + ' EXACT-DACL')) ($c -join ' | ')
+    Check 'M1 Set-ExactDacl builds a fresh protected ACL: purge every rule, then SYSTEM F, Administrators F, Users RX (SIDs), owner Administrators' (
+        $src -match '(?s)function Set-ExactDacl.*?Get-Acl -LiteralPath.*?SetAccessRuleProtection\(\$true, \$false\).*?RemoveAccessRuleSpecific.*?ContainerInherit, ObjectInherit.*?''S-1-5-18'', ''FullControl''.*?''S-1-5-32-544'', ''FullControl''.*?''S-1-5-32-545'', ''ReadAndExecute''.*?SetOwner.*?Set-Acl -LiteralPath' -and
+        $src -match ([regex]::Escape('$AclOwnerSid = ') + "'S-1-5-32-544'"))
+    Check 'M1 no entry ever gives Users more than read & execute' (-not ($src -match "'S-1-5-32-545', '(FullControl|Modify|Write)"))
     function Invoke-Icacls { param([string[]]$IcaclsArgs) return @{ Code = 5; Out = 'Access is denied.' } }
     Check 'F5 a failing icacls aborts with exit 1' ((ThrowsCode { Protect-AppDir $fakeApp }) -eq 1)
     . $applySafety
+    function Set-ExactDacl { param([string]$Path) throw 'Set-Acl failed' }
+    Check 'M1 a failing Set-ExactDacl aborts with exit 1' ((ThrowsCode { Protect-AppDir $fakeApp -NoRecurse }) -eq 1)
+    . $applySafety
 
-    # ---- F5: the real icacls on a throw-away folder (fake files, %TEMP% only; never a real path)
+    # ---- S4: links (junctions) inside are deleted, never followed; a link as the folder itself is refused
+    $s4 = Join-Path $sbRoot 's4'; $decoy = Join-Path $s4 'decoy'; $s4App = Join-Path $s4 'app'
+    New-Item -ItemType Directory -Path $decoy, (Join-Path $s4App 'sub\deep') -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $decoy 'precious.txt'), 'keep');  [IO.File]::WriteAllText((Join-Path $s4App 'writer.exe'), 'x')
+    $null = & cmd.exe /c mklink /J (Join-Path $s4App 'link1') $decoy
+    $null = & cmd.exe /c mklink /J (Join-Path $s4App 'sub\deep\link2') $decoy
+    Check 'S4 setup: two junctions exist inside the folder' ((Test-ReparsePoint (Join-Path $s4App 'link1')) -and (Test-ReparsePoint (Join-Path $s4App 'sub\deep\link2')))
+    $script:aclCalls = @(); Protect-AppDir $s4App
+    Check 'S4 both junctions are gone (also the nested one)' (-not (Test-Path -LiteralPath (Join-Path $s4App 'link1')) -and -not (Test-Path -LiteralPath (Join-Path $s4App 'sub\deep\link2')))
+    Check 'S4 ... and their target was NOT touched' ((Test-Path -LiteralPath (Join-Path $decoy 'precious.txt')) -and [IO.File]::ReadAllText((Join-Path $decoy 'precious.txt')) -eq 'keep')
+    Check 'S4 ... the real files stayed, and the /T operations ran afterwards' ((Test-Path (Join-Path $s4App 'writer.exe')) -and @(Show-Calls | Where-Object { $_ -match '/reset /T' }).Count -eq 1)
+    $null = & cmd.exe /c mklink /J (Join-Path $s4 'applink') $decoy
+    $script:aclCalls = @()
+    Check 'S4 the folder itself being a junction is refused (exit 1), nothing is changed' ((ThrowsCode { Protect-AppDir (Join-Path $s4 'applink') }) -eq 1 -and $script:aclCalls.Count -eq 0 -and (Test-Path -LiteralPath (Join-Path $decoy 'precious.txt')))
+    Check 'S4 the uninstall also removes links before it scans / deletes' ($src -match '(?s)if \(\$marker\.createdAppDir\) \{\s*if \(-not \$DryRun.*?Remove-ReparsePoints \$AppDir.*?Get-OwnedFileClassification \$AppDir')
+    Check 'S4 Protect-AppDir removes links before the first /T operation' ($src -match '(?s)function Protect-AppDir.*?Remove-ReparsePoints \$Dir.*?/setowner.*?/reset')
+
+    # ---- M1: the REAL Set-ExactDacl + icacls /reset on a throw-away tree (fake files under %TEMP% only; never a real path)
     $aclRoot = Join-Path $sbRoot 'acl-real'
-    $realApp = Join-Path $aclRoot 'RawAccel\RawAccel'
-    New-Item -ItemType Directory -Path (Join-Path $realApp 'sub') -Force | Out-Null
-    foreach ($f in 'writer.exe', 'settings.json', 'sub\x.dll', 'user-added.txt') { [IO.File]::WriteAllText((Join-Path $realApp $f), 'x') }
+    $realRoot = Join-Path $aclRoot 'RawAccel'
+    $realApp = Join-Path $realRoot 'RawAccel'
+    $realHnd = Join-Path $realRoot 'mousecal'
     $mySid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $randSid = 'S-1-5-21-1111111111-2222222222-3333333333-4444'
     $unsafe = [Security.AccessControl.FileSystemRights]'WriteData, AppendData, WriteAttributes, WriteExtendedAttributes, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
-    function Get-TestAcl([string]$p) {
-        if (Get-Command Get-Acl -ErrorAction SilentlyContinue) { return (Get-Acl -LiteralPath $p) }
-        return (Get-Item -LiteralPath $p -Force).GetAccessControl()
-    }
+    function Assert-InSandbox([string]$p) { if (-not $p.StartsWith($sbRoot + '\', [StringComparison]::OrdinalIgnoreCase) -or $p -match '\.\.') { throw "SAFETY: refusing to touch $p (outside $sbRoot)" } }
+    function Get-TestAcl([string]$p) { Assert-InSandbox $p; return (Get-Acl -LiteralPath $p) }
+    function Invoke-TestIcacls([string[]]$a) { Assert-InSandbox $a[0]; $null = & icacls.exe @a }
+    $origOwnerSid = $AclOwnerSid
     try {
-        # the situation seen on a real PC: pre-existing user Full control, explicit and for a single user, on files too
-        $null = & icacls.exe $realApp '/inheritance:e' '/grant' '*S-1-5-32-545:(OI)(CI)F' '/T' '/C'
-        $null = & icacls.exe (Join-Path $realApp 'settings.json') '/grant' ('*' + $mySid + ':F')
-        $null = & icacls.exe (Join-Path $realApp 'sub\x.dll') '/grant' '*S-1-1-0:F'
+        foreach ($d in $realApp, (Join-Path $realApp 'sub'), $realHnd) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+        foreach ($f in 'writer.exe', 'settings.json', 'sub\x.dll', 'user-added.txt') { [IO.File]::WriteAllText((Join-Path $realApp $f), 'x') }
+        [IO.File]::WriteAllText((Join-Path $realHnd 'handler.vbs'), 'x'); [IO.File]::WriteAllText((Join-Path $realRoot 'apply.vbs'), 'x')
+        # the worst case: root, app dir and handler dir all carry Everyone:F and a random explicit SID (and inherit them down), plus per-file extras
+        foreach ($d in $realRoot, $realApp, $realHnd) {
+            Invoke-TestIcacls @($d, '/inheritance:e', '/grant', '*S-1-1-0:(OI)(CI)F', '/grant', '*S-1-5-32-545:(OI)(CI)F')
+            # a SID icacls cannot resolve: added through the ACL object (an orphaned / foreign-domain SID)
+            Assert-InSandbox $d
+            $seed = Get-Acl -LiteralPath $d
+            $seed.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier($randSid)), 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+            Set-Acl -LiteralPath $d -AclObject $seed
+        }
+        Invoke-TestIcacls @((Join-Path $realApp 'settings.json'), '/grant', ('*' + $mySid + ':F'))
+        Invoke-TestIcacls @((Join-Path $realApp 'sub\x.dll'), '/grant', '*S-1-1-0:F')
+        Invoke-TestIcacls @((Join-Path $realApp 'user-added.txt'), '/deny', '*S-1-5-11:W')
         $before = Get-TestAcl (Join-Path $realApp 'settings.json')
-        Check 'F5 setup of the scenario: Users (and Everyone) really had write access first' (@($before.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-32-545' -and ($_.FileSystemRights -band $unsafe) }).Count -gt 0)
-        function Invoke-Icacls { param([string[]]$IcaclsArgs) $script:aclCalls += , $IcaclsArgs; if ($IcaclsArgs -contains '/setowner') { return @{ Code = 0; Out = 'skipped: needs an elevated token' } }; return (& $realInvokeIcacls -IcaclsArgs $IcaclsArgs) }
+        Check 'M1 setup of the scenario: Users, Everyone and the random SID really had write access first' (@($before.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-32-545' -and ($_.FileSystemRights -band $unsafe) }).Count -gt 0 -and @((Get-TestAcl $realRoot).Access | Where-Object { $_.IdentityReference.Value -eq 'Everyone' }).Count -gt 0 -and @((Get-TestAcl $realHnd).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object { $_.IdentityReference.Value -eq $randSid }).Count -gt 0)
+        # not elevated: the owner of everything is the current user already (nothing to take), and /setowner would need a token we do not have
+        $AclOwnerSid = $mySid
+        Set-Item function:Set-ExactDacl $realSetExactDacl
+        function Invoke-Icacls { param([string[]]$IcaclsArgs) Assert-InSandbox $IcaclsArgs[0].TrimEnd('*').TrimEnd('\'); $script:aclCalls += , $IcaclsArgs; if ($IcaclsArgs -contains '/setowner') { return @{ Code = 0; Out = 'skipped: needs an elevated token' } }; return (& $realInvokeIcacls -IcaclsArgs $IcaclsArgs) }
         $script:aclCalls = @()
+        Assert-InSandbox $realRoot; Assert-InSandbox $realApp; Assert-InSandbox $realHnd
+        Protect-AppDir $realRoot -NoRecurse
         Protect-AppDir $realApp
-        . $applySafety      # back to the recorder
-        $okAll = $true; $why = @()
-        foreach ($f in '', 'writer.exe', 'settings.json', 'sub', 'sub\x.dll', 'user-added.txt') {
-            $p = if ($f) { Join-Path $realApp $f } else { $realApp }
-            $rules = @((Get-TestAcl $p).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object { $_.AccessControlType -eq 'Allow' })
+        Protect-AppDir $realHnd
+        . $applySafety      # back to the recorders
+        $AclOwnerSid = $origOwnerSid
+        $okAll = $true; $why = @(); $seen = 0
+        $items = @($realRoot, (Join-Path $realRoot 'apply.vbs'), $realApp, $realHnd) + @(Get-ChildItem -LiteralPath $realApp -Recurse -Force | ForEach-Object { $_.FullName }) + @(Get-ChildItem -LiteralPath $realHnd -Recurse -Force | ForEach-Object { $_.FullName })
+        foreach ($p in $items) {
+            $seen++
+            $rules = @((Get-TestAcl $p).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+            $sids = @($rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+            $short = $p.Substring($sbRoot.Length)
+            if (($sids -join ',') -ne 'S-1-5-18,S-1-5-32-544,S-1-5-32-545') { $okAll = $false; $why += "$short has SIDs [$($sids -join ',')]" }
+            if (@($rules | Where-Object { $_.AccessControlType -ne 'Allow' }).Count -gt 0) { $okAll = $false; $why += "$short has a deny entry" }
+            if ($rules.Count -ne 3) { $okAll = $false; $why += "$short has $($rules.Count) entries (want exactly 3)" }
             foreach ($rule in $rules) {
                 $sid = $rule.IdentityReference.Value
-                if (@('S-1-5-18', 'S-1-5-32-544', 'S-1-5-32-545') -notcontains $sid) { $okAll = $false; $why += "$f has an ACE for $sid" }
-                elseif ($sid -eq 'S-1-5-32-545' -and ($rule.FileSystemRights -band $unsafe)) { $okAll = $false; $why += "$f lets Users write ($($rule.FileSystemRights))" }
+                if ($sid -eq 'S-1-5-32-545' -and (($rule.FileSystemRights -band $unsafe) -or ($rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::ReadAndExecute) -ne [Security.AccessControl.FileSystemRights]::ReadAndExecute)) { $okAll = $false; $why += "$short Users has $($rule.FileSystemRights)" }
+                elseif ($sid -ne 'S-1-5-32-545' -and ($rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -ne [Security.AccessControl.FileSystemRights]::FullControl) { $okAll = $false; $why += "$short $sid is not full control" }
             }
-            foreach ($need in 'S-1-5-18', 'S-1-5-32-544') {
-                if (-not (@($rules | Where-Object { $_.IdentityReference.Value -eq $need -and ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::FullControl) -eq [Security.AccessControl.FileSystemRights]::FullControl }).Count)) { $okAll = $false; $why += "$f lacks full control for $need" }
-            }
-            if (-not (@($rules | Where-Object { $_.IdentityReference.Value -eq 'S-1-5-32-545' -and ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::ReadAndExecute) -eq [Security.AccessControl.FileSystemRights]::ReadAndExecute }).Count)) { $okAll = $false; $why += "$f lacks Users read/execute" }
         }
-        Check 'F5 real icacls: every file and folder is SYSTEM/Administrators full + Users read/execute only (no user-specific or Everyone entries)' $okAll ($why -join '; ')
-        Check 'F5 real icacls: the folder no longer inherits' ((Get-TestAcl $realApp).AreAccessRulesProtected)
+        Check "M1 real ACLs: root, app dir, handler dir and all $seen items below end with EXACTLY SYSTEM F, Administrators F, Users RX (no Everyone, no random SID, no deny, no extra)" ($okAll -and $seen -ge 10) ($why -join '; ')
+        Check 'M1 real ACLs: root, app dir and handler dir no longer inherit' ((Get-TestAcl $realRoot).AreAccessRulesProtected -and (Get-TestAcl $realApp).AreAccessRulesProtected -and (Get-TestAcl $realHnd).AreAccessRulesProtected)
+        Check 'M1 real ACLs: the children inherit (nothing explicit left)' (-not (Get-TestAcl (Join-Path $realApp 'settings.json')).AreAccessRulesProtected -and @((Get-TestAcl (Join-Path $realApp 'settings.json')).GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier])).Count -eq 0)
     } finally {
         . $applySafety
-        $null = & icacls.exe $realApp '/grant:r' ('*' + $mySid + ':(OI)(CI)F') '/T' '/C'   # throw-away folder: give the cleanup access back
-        Remove-Item -LiteralPath $aclRoot -Recurse -Force -ErrorAction SilentlyContinue
+        $AclOwnerSid = $origOwnerSid
+        if ($aclRoot.StartsWith($sbRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            $null = & icacls.exe $aclRoot '/grant:r' ('*' + $mySid + ':(OI)(CI)F') '/T' '/C'   # throw-away folder: give the cleanup access back
+            Remove-Item -LiteralPath $aclRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
-    Check 'F5 real icacls test folder cleaned up' (-not (Test-Path -LiteralPath $aclRoot))
+    Check 'M1 real ACL test folder cleaned up' (-not (Test-Path -LiteralPath $aclRoot))
 
     # ---- F1: one real run at a time (named mutex; TEST_MOCK name so the real one is never involved)
     $mxName = 'Global\TEST_MOCK_mousecal-' + [guid]::NewGuid().ToString('N')
@@ -943,18 +1009,37 @@ try {
     . $setupPath; . $applySafety
     $ZipFilesText = $rows -join "`n"; $ZipSha256 = Get-BytesSha256 $fakeZip
 
-    # ---- F1: per-run staging folder
+    # ---- F1/L1: per-run staging folder (root locked + owned first, .staging owned before it is ACL'd)
     $script:InstallRoot = Join-Path $sbRoot 'stg\RawAccel'; $script:Tx = $null
-    $script:aclCalls = @()
-    $sa = New-StageDir; $sb2 = New-StageDir
-    Check 'F1 two runs get two different .staging\<guid> folders' ($sa -ne $sb2 -and (Test-Path $sa) -and (Test-Path $sb2) -and (Split-Path -Leaf (Split-Path -Parent $sa)) -eq '.staging' -and (Split-Path -Leaf $sa) -match '^[0-9a-f]{32}$')
+    $script:aclCalls = @(); $script:stagingAtRootLock = $null
+    function Set-ExactDacl { param([string]$Path) $script:aclCalls += , @($Path, 'EXACT-DACL'); $script:stagingAtRootLock = Test-Path -LiteralPath (Join-Path $script:InstallRoot '.staging') }
+    $sa = New-StageDir
     $c = Show-Calls
-    Check 'F1 .staging and the run folder are both locked to Administrators + SYSTEM' ($c.Count -eq 4 -and (@($c | Where-Object { $_ -match '/inheritance:r /grant:r \*S-1-5-32-544:\(OI\)\(CI\)F \*S-1-5-18:\(OI\)\(CI\)F$' }).Count -eq 4)) ($c -join ' | ')
+    Check 'L1 the root is locked (exact DACL) before .staging exists' ($c[0] -ceq ($script:InstallRoot + ' EXACT-DACL') -and $script:stagingAtRootLock -eq $false) ($c -join ' | ')
+    Check 'L1 .staging and the run folder: owner Administrators first, then locked to Administrators + SYSTEM' ($c.Count -eq 5 -and $c[1] -ceq ((Split-Path -Parent $sa) + ' /setowner *S-1-5-32-544') -and $c[2] -match '/inheritance:r /grant:r \*S-1-5-32-544:\(OI\)\(CI\)F \*S-1-5-18:\(OI\)\(CI\)F$' -and $c[3] -ceq ($sa + ' /setowner *S-1-5-32-544') -and $c[4] -match '/inheritance:r /grant:r \*S-1-5-32-544:\(OI\)\(CI\)F \*S-1-5-18:\(OI\)\(CI\)F$') ($c -join ' | ')
+    $sb2 = New-StageDir
+    Check 'F1 two runs get two different .staging\<guid> folders' ($sa -ne $sb2 -and (Test-Path $sa) -and (Test-Path $sb2) -and (Split-Path -Leaf (Split-Path -Parent $sa)) -eq '.staging' -and (Split-Path -Leaf $sa) -match '^[0-9a-f]{32}$')
+    . $applySafety
     $script:StageDir = $sa; Remove-StageDir
     Check 'F1 cleanup removes only its own folder' (-not (Test-Path $sa) -and (Test-Path $sb2) -and (Test-Path (Split-Path -Parent $sb2)))
     $script:StageDir = $sb2; Remove-StageDir
     Check 'F1 ... and the empty .staging parent at the end' (-not (Test-Path (Split-Path -Parent $sb2)))
     $script:StageDir = $null
+    $script:aclCalls = @()
+    # L3: stale staging folders of crashed runs are deleted (links inside are not followed)
+    Set-Item function:Clear-StaleStaging $realClearStale
+    if (-not $script:InstallRoot.StartsWith($sbRoot + '', [StringComparison]::OrdinalIgnoreCase)) { throw 'SAFETY: InstallRoot is not the sandbox' }
+    $stg = Join-Path $script:InstallRoot '.staging'; $decoy3 = Join-Path $sbRoot 'stg-decoy'
+    New-Item -ItemType Directory -Path $decoy3, (Join-Path $stg 'aaaa\inner'), (Join-Path $stg 'bbbb') -Force | Out-Null
+    [IO.File]::WriteAllText((Join-Path $decoy3 'precious.txt'), 'keep'); [IO.File]::WriteAllText((Join-Path $stg 'aaaa\inner\x.bin'), 'x'); [IO.File]::WriteAllText((Join-Path $stg 'loose.txt'), 'x')
+    $null = & cmd.exe /c mklink /J (Join-Path $stg 'bbbb\lnk') $decoy3
+    Clear-StaleStaging
+    Check 'L3 every stale .staging\* entry is deleted (and the empty .staging)' (-not (Test-Path -LiteralPath $stg)) ((Get-ChildItem -LiteralPath $stg -Force -ErrorAction SilentlyContinue | ForEach-Object Name) -join ',')
+    Check 'L3 a junction inside a stale folder was not followed' ((Test-Path -LiteralPath (Join-Path $decoy3 'precious.txt')) -and [IO.File]::ReadAllText((Join-Path $decoy3 'precious.txt')) -eq 'keep')
+    Clear-StaleStaging
+    Check 'L3 nothing to clean is fine' (-not (Throws { Clear-StaleStaging }))
+    . $applySafety
+    Check 'L3 main cleans stale staging under the mutex, before install / uninstall, never for -DryRun' ($src -match '(?s)\$script:SetupLock = Enter-SetupLock.*?if \(-not \$DryRun\) \{ Clear-StaleStaging \}.*?if \(\$arg\.Kind -eq ''Uninstall''\) \{ Invoke-Uninstall')
 
     # ---- F4 / F7 / hidden elevation: handler.ps1 and handler.vbs
     $hd = Join-Path $sbRoot 'hnd'; New-Item -ItemType Directory -Path $hd | Out-Null
@@ -1028,16 +1113,17 @@ try {
         function Register-ScheduledTask { }
         function Export-ScheduledTask { param($TaskName) return '<task/>' }
         function Restart-MouseDevices { param([switch]$All) $script:restarted = $true; return 1 }
-        function Get-MouseDeviceStatus { if ($script:restarted) { return $script:miceAfter }; return $script:miceBefore }
+        function Get-MouseDeviceStatus { if ($script:restarted) { if ($script:miceAfterSeq.Count -gt 0) { $h = $script:miceAfterSeq[[math]::Min($script:miceIdx, $script:miceAfterSeq.Count - 1)]; $script:miceIdx++; return $h }; return $script:miceAfter }; return $script:miceBefore }
         function Get-RunningAntiCheatGames { return @() }
-        function Start-Process { param($FilePath, $ArgumentList, $WorkingDirectory, $WindowStyle, [switch]$Wait, [switch]$PassThru) return [pscustomobject]@{ ExitCode = $script:writerExit } }
+        function Start-Process { param($FilePath, $ArgumentList, $WorkingDirectory, $WindowStyle, [switch]$Wait, [switch]$PassThru) return (New-FakeProc $script:writerExit) }
         function Get-AuthenticodeSignature { param($LiteralPath) return [pscustomobject]@{ Status = 'Valid'; SignerCertificate = [pscustomobject]@{ Subject = 'CN=fake, O=Microsoft Corporation' } } }
         function Test-SettingsJson { param($d, $j, $w) }
         function Invoke-DriverTool { param($Exe, $Mode, $TimeoutSec) $script:calls.Tool++; return @{ Ok = $script:toolOk; Output = 'stub' } }
         function Invoke-Icacls { param([string[]]$IcaclsArgs) $script:aclCalls += , $IcaclsArgs; $script:aclState += , @{ Writer = (Test-Path (Join-Path $script:AppDir 'writer.exe')); Settings = (Test-Path $script:SettingsPath) }; return @{ Code = 0; Out = '' } }
+        function Set-ExactDacl { param([string]$Path) $script:aclCalls += , @($Path, 'EXACT-DACL'); $script:aclState += , @{ Writer = (Test-Path (Join-Path $script:AppDir 'writer.exe')); Settings = (Test-Path $script:SettingsPath) } }
     }
     . $r3Stubs
-    function New-Sandbox3 { New-Sandbox; $script:daSeq = @(); $script:daCalls = 0; $script:rotMixed = $false; $script:restarted = $false; $script:miceBefore = @{}; $script:miceAfter = @{}; $script:aclCalls = @(); $script:aclState = @(); $script:rpt = 0 }
+    function New-Sandbox3 { New-Sandbox; $script:daSeq = @(); $script:daCalls = 0; $script:rotMixed = $false; $script:restarted = $false; $script:miceBefore = @{}; $script:miceAfter = @{}; $script:aclCalls = @(); $script:aclState = @(); $script:rpt = 0; $script:miceAfterSeq = @(); $script:miceIdx = 0 }
     $script:daSeq = @(); $script:daCalls = 0; $script:rotMixed = $false; $script:restarted = $false; $script:miceBefore = @{}; $script:miceAfter = @{}; $script:aclState = @()
 
     # F5 in the install flow: locked before the first copy, again after settings.json
@@ -1045,8 +1131,8 @@ try {
     $r = Run-Install $mm
     Check 'F5 flow: the install succeeds with the stubs' (-not $r.Threw) $r.Out
     $c = Show-Calls
-    Check 'F5 flow: the install root is locked non-recursively' ($c[0] -ceq ($script:InstallRoot + ' /inheritance:r /grant:r *S-1-5-18:(OI)(CI)F *S-1-5-32-544:(OI)(CI)F *S-1-5-32-545:(OI)(CI)RX'))
-    $iApp = @(0..($script:aclCalls.Count - 1) | Where-Object { $script:aclCalls[$_][0] -eq $script:AppDir -and $script:aclCalls[$_] -contains '/inheritance:r' })
+    Check 'F5 flow: the install root is locked non-recursively (exact DACL, no /T)' ($c[0] -ceq ($script:InstallRoot + ' EXACT-DACL') -and @($c | Where-Object { $_ -match ([regex]::Escape($script:InstallRoot + ' ') + '/') }).Count -eq 0) ($c -join ' | ')
+    $iApp = @(0..($script:aclCalls.Count - 1) | Where-Object { $script:aclCalls[$_][0] -eq $script:AppDir -and $script:aclCalls[$_] -contains 'EXACT-DACL' })
     Check 'F5 flow: the app dir is locked twice (before the copy, after settings.json)' ($iApp.Count -eq 2) ($c -join ' | ')
     Check 'F5 flow: first lock happens before writer.exe exists' ($script:aclState[$iApp[0]].Writer -eq $false)
     Check 'F5 flow: second lock happens after settings.json was written' ($script:aclState[$iApp[1]].Settings -eq $true)
@@ -1078,7 +1164,16 @@ try {
     Check 'F6 flow: a mouse that was already broken is ignored' (-not $r.Threw) "$($r.Code) $($r.Out)"
     New-Sandbox3; $script:daSeq = @($false, $false, $true); $script:miceBefore = @{ 'HID\A' = 'OK' }; $script:miceAfter = @{}
     $r = Run-Install $mm
-    Check 'F6 flow: a mouse that is no longer present is ignored (unplugged)' (-not $r.Threw) "$($r.Code) $($r.Out)"
+    Check 'S6 flow: a mouse that was OK and is missing after the restart (and stays missing) -> regression, exit 8, rolled back' ($r.Threw -and $r.Code -eq 8 -and $r.Out -match 'HID\\A' -and -not (Test-Path $script:MarkerPath)) "$($r.Code) $($r.Out)"
+    # ... but one that reappears within the settle time is fine (devices re-enumerate after a restart)
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    $script:MouseSettleSeconds = 10; $script:miceIdx = 0
+    New-Sandbox3; $script:daSeq = @($false, $false, $true); $script:miceBefore = @{ 'HID\A' = 'OK' }; $script:miceAfterSeq = @(@{}, @{}, @{}, @{ 'HID\A' = 'OK' })
+    $r = Run-Install $mm
+    Check 'S6 flow: a mouse missing at first but back within the settle time -> no regression' (-not $r.Threw -and $script:miceIdx -ge 4) "$($r.Code) $($r.Out) idx=$($script:miceIdx)"
+    $script:miceAfterSeq = @(); $script:miceIdx = 0
+    Remove-Item function:Start-Sleep
+    $script:MouseSettleSeconds = 0
 
     # F2: the marker says installedDriver=true BEFORE installer.exe runs
     Set-Item function:Install-RawAccelDriver $realInstallDriver
@@ -1127,6 +1222,91 @@ try {
     $r = Run-Install $mm
     Check 'P1 a successful re-run over it does replace the command (sanity)' ((-not $r.Threw) -and (Get-Item -LiteralPath ($testKey + '\shell\open\command')).GetValue('') -ceq (Get-ProtocolCommand (Hd)))
     Remove-TestKey
+    # ---- L2: rollback restarts the mice whenever this run restarted them (also when the filter pre-existed)
+    $script:restartLog = @()
+    function Restart-MouseDevices { param([switch]$All) $script:restarted = $true; $script:restartLog += , [bool]$All; return 1 }
+    New-Sandbox3; Seed-Prior $oldMarker; $script:writerExit = 1
+    $script:daSeq = @($false, $false, $true); $script:miceBefore = @{ 'HID\A' = 'OK' }; $script:miceAfter = @{ 'HID\A' = 'OK' }
+    $r = Run-Install $mm
+    Check 'L2 the filter pre-existed, this run restarted the mice, writer.exe failed -> rolled back' ($r.Threw -and $r.Code -eq 1 -and $script:calls.Tool -eq 0) "$($r.Code) $($r.Out)"
+    Check 'L2 ... and the mice were restarted again by the rollback (-All): 2 restarts, the last with -All' ($script:restartLog.Count -eq 2 -and $script:restartLog[0] -eq $false -and $script:restartLog[1] -eq $true) ($script:restartLog -join ',')
+    $script:restartLog = @()
+    New-Sandbox3; Seed-Prior $oldMarker; $script:writerExit = 1     # driver already active: no restart in this run -> none in the rollback
+    $r = Run-Install $mm
+    Check 'L2 no restart in this run -> the rollback does not restart either' ($r.Threw -and $script:restartLog.Count -eq 0) ($script:restartLog -join ',')
+    Check 'L2 structure: New-Tx has DevicesRestarted, set before Restart-MouseDevices in the install' ($src -match 'DevicesRestarted = \$false' -and $src -match '(?s)DevicesRestarted = \$true.*?\[void\]\(Restart-MouseDevices\)')
+    . $r3Stubs
+    function Invoke-DriverTool { param($Exe, $Mode, $TimeoutSec) $script:calls.Tool++; return @{ Ok = $script:toolOk; Output = 'stub' } }
+
+    # ---- S1: writer.exe waits at most 30 s, then it is killed and the run fails (rollback)
+    $script:writerHang = $true; $script:waitedMs = $null; $script:killed = 0
+    New-Sandbox3; Seed-Prior $oldMarker; $script:writerExit = 0
+    $r = Run-Install $mm
+    Check 'S1 a writer.exe that never finishes: waited 30000 ms, killed, run fails with exit 1' ($r.Threw -and $r.Code -eq 1 -and $script:waitedMs -eq 30000 -and $script:killed -ge 1 -and $r.Out -match '30') "$($r.Code) $($script:waitedMs) $($script:killed) $($r.Out)"
+    Check 'S1 ... and it is rolled back (the registered protocol key and the task are undone)' ($script:calls.Unregister -ge 1 -and -not (Test-Path -LiteralPath $testKey))
+    $script:writerHang = $false; $script:killed = 0
+    New-Sandbox3; Seed-Prior $oldMarker; $script:writerExit = 0
+    $r = Run-Install $mm
+    Check 'S1 a writer.exe that finishes in time: no kill, success' (-not $r.Threw -and $script:killed -eq 0) "$($r.Code) $($r.Out)"
+    Remove-TestKey
+    Check 'S1 every other child we wait on is bounded: VC++ redist 10 min, validator / rotation reader 60 s, pnputil 30 s' ($src -match 'Wait-ChildProcess \$p 600' -and $src -match 'Invoke-BoundedProcess \$ps51 \$a 60' -and $src -match 'pnputil\.exe.*?\$WriterTimeoutSec' -and (($src -split 'function Invoke-Install\(')[1] -notmatch '-Wait') -and $src -match '\$WriterTimeoutSec = 30')
+    $t0 = Get-Date
+    $bp = Invoke-BoundedProcess (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') @('-NoProfile', '-Command', 'Start-Sleep -Seconds 60') 2
+    $el = ((Get-Date) - $t0).TotalSeconds
+    Check 'S1 Invoke-BoundedProcess kills a hanging child after the limit' ($bp.TimedOut -and $bp.Code -eq 124 -and $el -lt 15) "el=$el"
+    $bp = Invoke-BoundedProcess (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') @('-NoProfile', '-Command', 'Write-Output hello; exit 3') 60
+    Check 'S1 Invoke-BoundedProcess returns exit code and output of a child that finishes' (-not $bp.TimedOut -and $bp.Code -eq 3 -and $bp.Out -eq 'hello') "$($bp.Code) [$($bp.Out)]"
+
+    $argProbe = Join-Path $sbRoot 'argprobe.ps1'; [IO.File]::WriteAllText($argProbe, 'Write-Output $args[0]; Write-Output $args[1]')
+    $bp = Invoke-BoundedProcess (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') @('-NoProfile', '-File', $argProbe, 'C:\some dir\', 'a "q" b') 60
+    Check 'S1 Invoke-BoundedProcess passes arguments with spaces, quotes and a trailing backslash intact' (($bp.Out -split "`r?`n")[0] -ceq 'C:\some dir\' -and ($bp.Out -split "`r?`n")[1] -ceq 'a "q" b') $bp.Out
+
+    # ---- L4: the protocol key restore keeps the original value kinds
+    $kindKey = $testKey + '-kind'
+    Remove-Item -LiteralPath $kindKey -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -Path ($kindKey + '\shell\open\command') -Force | Out-Null
+    New-ItemProperty -LiteralPath $kindKey -Name '(default)' -Value '%SystemRoot%\old-default' -PropertyType ExpandString -Force | Out-Null
+    New-ItemProperty -LiteralPath $kindKey -Name 'URL Protocol' -Value '%TEMP%\x' -PropertyType ExpandString -Force | Out-Null
+    $cmdOld = '"%SystemRoot%\System32\wscript.exe" "C:\old\handler.vbs" "%1"'
+    New-ItemProperty -LiteralPath ($kindKey + '\shell\open\command') -Name '(default)' -Value $cmdOld -PropertyType ExpandString -Force | Out-Null
+    $sn = Get-UrlProtocolSnapshot $kindKey
+    Set-Item -LiteralPath $kindKey -Value 'changed'; Set-Item -LiteralPath ($kindKey + '\shell\open\command') -Value 'changed'
+    New-ItemProperty -LiteralPath $kindKey -Name 'URL Protocol' -Value '' -PropertyType String -Force | Out-Null
+    Restore-UrlProtocolSnapshot $sn $kindKey
+    $k = Get-Item -LiteralPath $kindKey; $kc = Get-Item -LiteralPath ($kindKey + '\shell\open\command')
+    Check 'L4 REG_EXPAND_SZ default / URL Protocol / command stay REG_EXPAND_SZ after a restore' ($k.GetValueKind('') -eq 'ExpandString' -and $k.GetValueKind('URL Protocol') -eq 'ExpandString' -and $kc.GetValueKind('') -eq 'ExpandString') "$($k.GetValueKind('')) $($k.GetValueKind('URL Protocol')) $($kc.GetValueKind(''))"
+    Check 'L4 ... with the raw (unexpanded) values' ($k.GetValue('', $null, 'DoNotExpandEnvironmentNames') -ceq '%SystemRoot%\old-default' -and $k.GetValue('URL Protocol', $null, 'DoNotExpandEnvironmentNames') -ceq '%TEMP%\x' -and $kc.GetValue('', $null, 'DoNotExpandEnvironmentNames') -ceq $cmdOld)
+    Remove-Item -LiteralPath $kindKey -Recurse -Force -ErrorAction SilentlyContinue
+    New-Item -Path $kindKey -Force | Out-Null; Set-Item -LiteralPath $kindKey -Value 'URL:plain'
+    $sn = Get-UrlProtocolSnapshot $kindKey; New-ItemProperty -LiteralPath $kindKey -Name '(default)' -Value '%X%' -PropertyType ExpandString -Force | Out-Null
+    Restore-UrlProtocolSnapshot $sn $kindKey
+    Check 'L4 a plain REG_SZ default stays REG_SZ' ((Get-Item -LiteralPath $kindKey).GetValueKind('') -eq 'String' -and (Get-Item -LiteralPath $kindKey).GetValue('') -ceq 'URL:plain')
+    Remove-Item -LiteralPath $kindKey -Recurse -Force -ErrorAction SilentlyContinue
+
+    # ---- S5: elevated runs only search the Windows / Program Files module folders
+    $pfx = [Environment]::GetFolderPath('ProgramFiles'); $sysr = $env:SystemRoot
+    $mp = @('C:\Users\bob\Documents\WindowsPowerShell\Modules', 'D:\OneDrive\Documents\WindowsPowerShell\Modules', 'C:\Users\bob\Documents\PowerShell\Modules', "$pfx\PowerShell\Modules", "$pfx\WindowsApps\Microsoft.PowerShell_7.4.1_x64__8wekyb3d8bbwe\Modules", "$pfx\WindowsPowerShell\Modules", "$sysr\system32\WindowsPowerShell\v1.0\Modules") -join ';'
+    Check 'S5 elevated (5.1): only Program Files\WindowsPowerShell and System32 module folders remain' ((Get-SafeModulePath $mp $true $true) -ceq ("$pfx\WindowsPowerShell\Modules;$sysr\system32\WindowsPowerShell\v1.0\Modules")) (Get-SafeModulePath $mp $true $true)
+    Check 'S5 elevated (PowerShell 7): the user Documents folders go, the Program Files ones stay' ((Get-SafeModulePath $mp $true $false) -notmatch 'Documents|OneDrive' -and (Get-SafeModulePath $mp $true $false) -match 'Program Files\\PowerShell\\Modules')
+    Check 'S5 not elevated (5.1): only the PowerShell 7 folders are dropped (old behaviour)' ((Get-SafeModulePath $mp $false $true) -ceq ("C:\Users\bob\Documents\WindowsPowerShell\Modules;D:\OneDrive\Documents\WindowsPowerShell\Modules;$pfx\WindowsPowerShell\Modules;$sysr\system32\WindowsPowerShell\v1.0\Modules")) (Get-SafeModulePath $mp $false $true)
+    Check 'S5 a path with nothing usable falls back to $PSHOME\Modules' ((Get-SafeModulePath 'C:\Users\bob\Documents\WindowsPowerShell\Modules' $true $true) -ceq (Join-Path $PSHOME 'Modules'))
+    $pathBefore = $env:PSModulePath
+    try {
+        $env:PSModulePath = $mp
+        function Test-IsAdmin { return $true }
+        $orig = Repair-ModulePath
+        Check 'S5 Repair-ModulePath (elevated) sets the safe path and returns the original' ($orig -ceq $mp -and $env:PSModulePath -notmatch 'Documents|OneDrive|bob') $env:PSModulePath
+        $env:PSModulePath = $mp
+        function Test-IsAdmin { return $false }
+        $null = Repair-ModulePath
+        Check 'S5 Repair-ModulePath (not elevated) keeps the user folders' ($env:PSModulePath -match 'bob\\Documents\\WindowsPowerShell') $env:PSModulePath
+    } finally { $env:PSModulePath = $pathBefore; function Test-IsAdmin { return $true } }
+    Check 'S5 Invoke-MainCore repairs the path first and restores it at the end' ($src -match '(?s)function Invoke-MainCore.*?\$origModulePath = Repair-ModulePath.*?if \(\$origModulePath\) \{ \$env:PSModulePath = \$origModulePath \}')
+
+    # ---- housekeeping
+    $gi = [IO.File]::ReadAllText((Join-Path $here '..\.gitignore'))
+    Check '.gitignore ignores .claude/' ($gi -split "`r?`n" -contains '.claude/')
+
     Check 'R3 SAFETY: the real HKLM:\SOFTWARE\Classes\mousecal is still as before' ((Test-Path -LiteralPath 'HKLM:\SOFTWARE\Classes\mousecal') -eq $hklmKeyBefore)
 } finally {
     Remove-Item -LiteralPath $sbRoot -Recurse -Force -ErrorAction SilentlyContinue
